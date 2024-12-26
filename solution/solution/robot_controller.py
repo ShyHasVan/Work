@@ -65,7 +65,10 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Class variables used to store persistent values
+        # Initialize Nav2 first
+        self.navigator = BasicNavigator()
+        
+        # Class variables
         self.pose = Pose()
         self.previous_pose = Pose()
         self.yaw = 0.0
@@ -75,7 +78,20 @@ class RobotController(Node):
         self.goal_distance = random.uniform(1.0, 2.0)
         self.scan_triggered = [False] * 4
         self.items = ItemList()
-        self.nav2_initialized = False  # New flag
+        
+        # Wait for Nav2 to be ready
+        self.get_logger().info('Waiting for Nav2...')
+        self.navigator.waitUntilNav2Active()
+        self.get_logger().info('Nav2 activated successfully!')
+        
+        # Set initial pose
+        initial_pose = PoseStamped()
+        initial_pose.header.frame_id = 'map'
+        initial_pose.header.stamp = self.get_clock().now().to_msg()
+        initial_pose.pose.position.x = 0.0
+        initial_pose.pose.position.y = 0.0
+        initial_pose.pose.orientation.w = 1.0
+        self.navigator.setInitialPose(initial_pose)
 
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
@@ -173,20 +189,6 @@ class RobotController(Node):
             self.pose.orientation.w])
         
         self.yaw = yaw
-
-        # Initialize Nav2 after receiving first pose
-        if not self.nav2_initialized:
-            self.navigator = BasicNavigator()
-            self.get_logger().info('Waiting for Nav2...')
-            self.navigator.waitUntilNav2Active()
-            self.get_logger().info('Nav2 activated successfully!')
-            
-            initial_pose = PoseStamped()
-            initial_pose.header.frame_id = 'map'
-            initial_pose.header.stamp = self.get_clock().now().to_msg()
-            initial_pose.pose = self.pose
-            self.navigator.setInitialPose(initial_pose)
-            self.nav2_initialized = True
 
     # Called every time scan_subscriber recieves a LaserScan message from the /scan topic
     #
@@ -359,44 +361,39 @@ class RobotController(Node):
                 # If we haven't started navigation yet
                 if not hasattr(self, 'navigation_started') or not self.navigation_started:
                     self.get_logger().info(f'Starting navigation to zone at ({goal_pose.pose.position.x}, {goal_pose.pose.position.y})')
-                    success = self.navigator.goToPose(goal_pose)
-                    if success:
-                        self.navigation_started = True
-                        self.get_logger().info('Navigation started successfully')
-                    else:
-                        self.get_logger().error('Failed to start navigation')
+                    self.navigator.goToPose(goal_pose)
+                    self.navigation_started = True
                     return
 
-                # Check navigation progress
-                if not self.navigator.isTaskComplete():
+                # Check if navigation is complete
+                if self.navigator.isTaskComplete():
+                    result = self.navigator.getResult()
+                    
+                    if result == TaskResult.SUCCEEDED:
+                        self.get_logger().info('Reached zone, attempting to offload')
+                        rqt = ItemRequest.Request()
+                        rqt.robot_id = self.robot_id
+                        try:
+                            future = self.offload_service.call_async(rqt)
+                            rclpy.spin_until_future_complete(self, future)
+                            response = future.result()
+                            if response.success:
+                                self.get_logger().info('Successfully offloaded item!')
+                                self.state = State.FORWARD
+                                self.navigation_started = False
+                            else:
+                                self.get_logger().info('Failed to offload item: ' + response.message)
+                        except Exception as e:
+                            self.get_logger().info(f'Service call failed: {str(e)}')
+                    else:
+                        self.get_logger().warn(f'Navigation failed with result: {result}')
+                        self.navigation_started = False
+                        self.state = State.FORWARD
+                else:
+                    # Still navigating, provide feedback
                     feedback = self.navigator.getFeedback()
                     if feedback:
                         self.get_logger().info(f'Distance remaining: {feedback.distance_remaining:.2f}m')
-                    return
-
-                # Navigation completed
-                result = self.navigator.getResult()
-                if result == TaskResult.SUCCEEDED:
-                    self.get_logger().info('Reached zone, attempting to offload')
-                    rqt = ItemRequest.Request()
-                    rqt.robot_id = self.robot_id
-                    try:
-                        future = self.offload_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
-                        response = future.result()
-                        if response.success:
-                            self.get_logger().info('Successfully offloaded item!')
-                            self.state = State.FORWARD
-                            self.navigation_started = False
-                        else:
-                            self.get_logger().info('Failed to offload item: ' + response.message)
-                    except Exception as e:
-                        self.get_logger().info(f'Service call failed: {str(e)}')
-                else:
-                    self.get_logger().warn(f'Navigation failed with result: {result}')
-                    self.navigation_started = False
-                    # Optionally retry or change state
-                    self.state = State.FORWARD
             case _:
                 pass
         
