@@ -65,9 +65,31 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Initialize Nav2 first
+        # Initialize Nav2
         self.navigator = BasicNavigator()
         
+        # Set initial pose first
+        initial_pose = PoseStamped()
+        initial_pose.header.frame_id = 'map'
+        initial_pose.header.stamp = self.get_clock().now().to_msg()
+        initial_pose.pose.position.x = 0.0
+        initial_pose.pose.position.y = 0.0
+        initial_pose.pose.orientation.w = 1.0
+        self.navigator.setInitialPose(initial_pose)
+        
+        # Then wait for Nav2 with timeout
+        try:
+            self.get_logger().info('Waiting for Nav2...')
+            if not self.navigator.waitUntilNav2Active(timeout_sec=10.0):
+                self.get_logger().error('Nav2 did not become active within timeout!')
+                rclpy.shutdown()
+                return
+            self.get_logger().info('Nav2 activated successfully!')
+        except Exception as e:
+            self.get_logger().error(f'Error waiting for Nav2: {str(e)}')
+            rclpy.shutdown()
+            return
+
         # Class variables
         self.pose = Pose()
         self.previous_pose = Pose()
@@ -79,20 +101,6 @@ class RobotController(Node):
         self.scan_triggered = [False] * 4
         self.items = ItemList()
         
-        # Wait for Nav2 to be ready
-        self.get_logger().info('Waiting for Nav2...')
-        self.navigator.waitUntilNav2Active()
-        self.get_logger().info('Nav2 activated successfully!')
-        
-        # Set initial pose
-        initial_pose = PoseStamped()
-        initial_pose.header.frame_id = 'map'
-        initial_pose.header.stamp = self.get_clock().now().to_msg()
-        initial_pose.pose.position.x = 0.0
-        initial_pose.pose.position.y = 0.0
-        initial_pose.pose.orientation.w = 1.0
-        self.navigator.setInitialPose(initial_pose)
-
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
 
