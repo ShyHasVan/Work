@@ -82,12 +82,12 @@ class RobotController(Node):
         client_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
 
-        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
+        self.pick_up_service = self.create_client(ItemRequest, '/item_sensor/pickup', callback_group=client_callback_group)
         self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
 
         self.item_subscriber = self.create_subscription(
             ItemList,
-            '/items',
+            '/item_sensor/items',
             self.item_callback,
             10, callback_group=timer_callback_group
         )
@@ -279,7 +279,6 @@ class RobotController(Node):
                     self.get_logger().info(f"Finished turning, driving forward by {self.goal_distance:.2f} metres")
 
             case State.COLLECTING:
-
                 if len(self.items.data) == 0:
                     self.previous_pose = self.pose
                     self.state = State.FORWARD
@@ -287,32 +286,39 @@ class RobotController(Node):
                 
                 item = self.items.data[0]
 
-                # Obtained by curve fitting from experimental runs.
-                estimated_distance = 32.4 * float(item.diameter) ** -0.75 #69.0 * float(item.diameter) ** -0.89
-
-                self.get_logger().info(f'Estimated distance {estimated_distance}')
-
-                if estimated_distance <= 0.35:
+                # Adjust speed and turning based on item position
+                msg = Twist()
+                
+                # Scale linear velocity based on how centered the item is
+                center_offset = abs(item.x - 320.0) / 320.0  # Normalized distance from center
+                base_speed = 0.15  # Slower base speed for more control
+                msg.linear.x = base_speed * (1 - 0.5 * center_offset)  # Slow down when turning
+                
+                # Proportional control for turning
+                turn_gain = 0.8  # Adjust this value to control turning sensitivity
+                msg.angular.z = turn_gain * (item.x - 320.0) / 320.0
+                
+                # Try to pick up when item appears large enough (close enough)
+                if float(item.diameter) > 120:  # Increased threshold for more reliable pickup
+                    msg.linear.x = 0  # Stop moving
+                    msg.angular.z = 0
+                    self.cmd_vel_publisher.publish(msg)
+                    
                     rqt = ItemRequest.Request()
                     rqt.robot_id = self.robot_id
                     try:
                         future = self.pick_up_service.call_async(rqt)
-                        self.executor.spin_until_future_complete(future)
+                        rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
-                            self.get_logger().info('Item picked up.')
+                            self.get_logger().info('Item picked up successfully')
                             self.state = State.FORWARD
-                            self.items.data = []
                         else:
-                            self.get_logger().info('Unable to pick up item: ' + response.message)
+                            self.get_logger().info('Failed to pick up item')
                     except Exception as e:
-                        self.get_logger().info('Exception ' + e)   
-
-                msg = Twist()
-                msg.linear.x = 0.25 * estimated_distance
-                msg.angular.z = item.x / 320.0
+                        self.get_logger().info(f'Service call failed: {str(e)}')
+                
                 self.cmd_vel_publisher.publish(msg)
-
             case _:
                 pass
         
