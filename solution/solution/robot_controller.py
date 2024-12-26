@@ -144,6 +144,9 @@ class RobotController(Node):
         self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
 
     def item_callback(self, msg):
+        if len(msg.data) > 0 and len(self.items.data) == 0:
+            # Only log when we first see an item
+            self.get_logger().info(f'New item detected! Count: {len(msg.data)}')
         self.items = msg
 
     # Called every time odom_subscriber receives an Odometry message from the /odom topic
@@ -198,6 +201,13 @@ class RobotController(Node):
 
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
+        # Add debug info about items near the start of control_loop
+        if len(self.items.data) > 0:
+            item = self.items.data[0]
+            self.get_logger().info(f'Current state: {self.state}, Items in view: {len(self.items.data)}, '
+                                 f'Nearest item at: ({item.x:.2f}, {item.y:.2f})')
+        elif self.state == State.COLLECTING:
+            self.get_logger().info('In COLLECTING state but no items visible!')
 
         # Send message to rviz_text_marker node
         marker_input = StringWithPose()
@@ -281,6 +291,7 @@ class RobotController(Node):
             case State.COLLECTING:
                 if len(self.items.data) == 0:
                     self.previous_pose = self.pose
+                    self.goal_distance = random.uniform(1.0, 2.0)
                     self.state = State.FORWARD
                     return
                 
@@ -288,35 +299,40 @@ class RobotController(Node):
 
                 # Adjust speed and turning based on item position
                 msg = Twist()
+
+                # Calculate angle and distance to item
+                angle_to_item = math.atan2(item.y, item.x)
+                distance_to_item = math.sqrt(item.x * item.x + item.y * item.y)
                 
-                # Scale linear velocity based on how centered the item is
-                center_offset = abs(item.x - 320.0) / 320.0  # Normalized distance from center
-                base_speed = 0.15  # Slower base speed for more control
-                msg.linear.x = base_speed * (1 - 0.5 * center_offset)  # Slow down when turning
-                
-                # Proportional control for turning
-                turn_gain = 0.8  # Adjust this value to control turning sensitivity
-                msg.angular.z = turn_gain * (item.x - 320.0) / 320.0
-                
-                # Try to pick up when item appears large enough (close enough)
-                if float(item.diameter) > 120:  # Increased threshold for more reliable pickup
-                    msg.linear.x = 0  # Stop moving
-                    msg.angular.z = 0
-                    self.cmd_vel_publisher.publish(msg)
-                    
-                    rqt = ItemRequest.Request()
-                    rqt.robot_id = self.robot_id
-                    try:
-                        future = self.pick_up_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
-                        response = future.result()
-                        if response.success:
-                            self.get_logger().info('Item picked up successfully')
-                            self.state = State.FORWARD
-                        else:
-                            self.get_logger().info('Failed to pick up item')
-                    except Exception as e:
-                        self.get_logger().info(f'Service call failed: {str(e)}')
+                self.get_logger().info(f'Item detected - Distance: {distance_to_item:.2f}m, Angle: {math.degrees(angle_to_item):.2f}°')
+
+                # First, turn to face the item
+                if abs(angle_to_item) > 0.1:  # About 5.7 degrees tolerance
+                    msg.angular.z = 0.3 if angle_to_item > 0 else -0.3
+                    msg.linear.x = 0.0
+                else:
+                    # Once facing the item, move forward
+                    msg.angular.z = 0.0
+                    if distance_to_item > 0.4:  # Stop a bit further away to ensure we're in range
+                        msg.linear.x = 0.15
+                    else:
+                        # We're close enough and facing the item, attempt pickup
+                        msg.linear.x = 0.0
+                        self.cmd_vel_publisher.publish(msg)
+                        
+                        rqt = ItemRequest.Request()
+                        rqt.robot_id = self.robot_id
+                        try:
+                            future = self.pick_up_service.call_async(rqt)
+                            rclpy.spin_until_future_complete(self, future)
+                            response = future.result()
+                            if response.success:
+                                self.get_logger().info('Successfully picked up item!')
+                                self.state = State.FORWARD
+                            else:
+                                self.get_logger().info('Failed to pick up item')
+                        except Exception as e:
+                            self.get_logger().info(f'Service call failed: {str(e)}')
                 
                 self.cmd_vel_publisher.publish(msg)
             case _:
