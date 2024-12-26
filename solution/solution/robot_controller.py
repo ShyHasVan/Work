@@ -296,21 +296,20 @@ class RobotController(Node):
                     self.state = State.FORWARD
                     return
                 
-                item = self.items.data[0]
+                # Choose the closest item based on diameter (larger diameter = closer)
+                closest_item = max(self.items.data, key=lambda x: x.diameter)
                 msg = Twist()
 
-                # Convert from camera coordinates to robot-relative coordinates
                 # x is left/right in camera view (negative is right)
                 # y is up/down in camera view (negative is down)
-                angle_to_item = -math.atan2(item.x, item.y)  # Negative because camera x is opposite to robot rotation
-                estimated_distance = 32.4 * float(item.diameter) ** -0.75
-                self.get_logger().info(f'Estimated distance {estimated_distance}')
+                angle_to_item = closest_item.x / 320.0  # Convert pixel x to normalized angle
+                estimated_distance = 32.4 * float(closest_item.diameter) ** -0.75
                 
                 self.get_logger().info(f'Item detected - Distance: {estimated_distance:.2f}m, Angle: {math.degrees(angle_to_item):.2f}°')
 
                 if estimated_distance < 0.35:  # DISTANCE from item_manager.py
-                    msg.linear.x = 0.25 * estimated_distance
-                    msg.angular.z = item.x / 320.0
+                    msg.linear.x = 0.0
+                    msg.angular.z = 0.0
                     self.cmd_vel_publisher.publish(msg)
                     
                     rqt = ItemRequest.Request()
@@ -330,17 +329,10 @@ class RobotController(Node):
                     except Exception as e:
                         self.get_logger().info(f'Service call failed: {str(e)}')
                 else:
-                    # Not close enough yet, keep approaching
-                    if abs(angle_to_item) > 0.1:  # About 5.7 degrees
-                        # Turn to face the item
-                        msg.angular.z = 0.2 if angle_to_item > 0 else -0.2
-                        msg.linear.x = 0.0
-                    else:
-                        # Move forward while keeping aligned
-                        msg.linear.x = min(0.15, estimated_distance)  # Slow down as we get closer
-                        msg.angular.z = 0.5 * angle_to_item  # Proportional correction
-                
-                self.cmd_vel_publisher.publish(msg)
+                    # Use proportional control for smoother approach
+                    msg.linear.x = 0.25 * estimated_distance  # Proportional to distance
+                    msg.angular.z = angle_to_item  # Proportional to angle offset
+                    self.cmd_vel_publisher.publish(msg)
             case _:
                 pass
         
