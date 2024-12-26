@@ -351,33 +351,45 @@ class RobotController(Node):
 
                 # If we haven't started navigation yet
                 if not hasattr(self, 'navigation_started') or not self.navigation_started:
-                    self.navigator.goToPose(goal_pose)
-                    self.navigation_started = True
+                    self.get_logger().info(f'Starting navigation to zone at ({goal_pose.pose.position.x}, {goal_pose.pose.position.y})')
+                    success = self.navigator.goToPose(goal_pose)
+                    if success:
+                        self.navigation_started = True
+                        self.get_logger().info('Navigation started successfully')
+                    else:
+                        self.get_logger().error('Failed to start navigation')
                     return
 
-                # Check if we've reached the goal
-                if self.navigator.isTaskComplete():
-                    result = self.navigator.getResult()
-                    
-                    if result == TaskResult.SUCCEEDED:
-                        # Try to offload
-                        rqt = ItemRequest.Request()
-                        rqt.robot_id = self.robot_id
-                        try:
-                            future = self.offload_service.call_async(rqt)
-                            rclpy.spin_until_future_complete(self, future)
-                            response = future.result()
-                            if response.success:
-                                self.get_logger().info('Successfully offloaded item!')
-                                self.state = State.FORWARD
-                                self.navigation_started = False
-                            else:
-                                self.get_logger().info('Failed to offload item: ' + response.message)
-                        except Exception as e:
-                            self.get_logger().info(f'Service call failed: {str(e)}')
-                    else:
-                        self.get_logger().info('Navigation failed, retrying...')
-                        self.navigation_started = False
+                # Check navigation progress
+                if not self.navigator.isTaskComplete():
+                    feedback = self.navigator.getFeedback()
+                    if feedback:
+                        self.get_logger().info(f'Distance remaining: {feedback.distance_remaining:.2f}m')
+                    return
+
+                # Navigation completed
+                result = self.navigator.getResult()
+                if result == TaskResult.SUCCEEDED:
+                    self.get_logger().info('Reached zone, attempting to offload')
+                    rqt = ItemRequest.Request()
+                    rqt.robot_id = self.robot_id
+                    try:
+                        future = self.offload_service.call_async(rqt)
+                        rclpy.spin_until_future_complete(self, future)
+                        response = future.result()
+                        if response.success:
+                            self.get_logger().info('Successfully offloaded item!')
+                            self.state = State.FORWARD
+                            self.navigation_started = False
+                        else:
+                            self.get_logger().info('Failed to offload item: ' + response.message)
+                    except Exception as e:
+                        self.get_logger().info(f'Service call failed: {str(e)}')
+                else:
+                    self.get_logger().warn(f'Navigation failed with result: {result}')
+                    self.navigation_started = False
+                    # Optionally retry or change state
+                    self.state = State.FORWARD
             case _:
                 pass
         
