@@ -65,20 +65,17 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
-        self.navigator = BasicNavigator()
-        self.navigator.waitUntilNav2Active()
-        
-        # Class variables used to store persistent values between executions of callbacks and control loop
-        self.state = State.FORWARD # Current FSM state
-        self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
-        self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
-        self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
-        self.previous_yaw = 0.0 # Snapshot of the angle for comparison against future angles
-        self.turn_angle = 0.0 # Relative angle to turn to in the TURNING state
-        self.turn_direction = TURN_LEFT # Direction to turn in the TURNING state
-        self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
-        self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
+        # Class variables used to store persistent values
+        self.pose = Pose()
+        self.previous_pose = Pose()
+        self.yaw = 0.0
+        self.previous_yaw = 0.0
+        self.turn_angle = 0.0
+        self.turn_direction = TURN_LEFT
+        self.goal_distance = random.uniform(1.0, 2.0)
+        self.scan_triggered = [False] * 4
         self.items = ItemList()
+        self.nav2_initialized = False  # New flag
 
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
@@ -167,19 +164,29 @@ class RobotController(Node):
     #
     # The pose estimates are expressed in a coordinate system relative to the starting pose of the robot
     def odom_callback(self, msg):
-        self.pose = msg.pose.pose # Store the pose in a class variable
+        self.pose = msg.pose.pose
+        
+        (roll, pitch, yaw) = euler_from_quaternion([
+            self.pose.orientation.x,
+            self.pose.orientation.y,
+            self.pose.orientation.z,
+            self.pose.orientation.w])
+        
+        self.yaw = yaw
 
-        # Uses tf_transformations package to convert orientation from quaternion to Euler angles (RPY = roll, pitch, yaw)
-        # https://github.com/DLu/tf_transformations
-        #
-        # Roll (rotation around X axis) and pitch (rotation around Y axis) are discarded
-        (roll, pitch, yaw) = euler_from_quaternion([self.pose.orientation.x,
-                                                    self.pose.orientation.y,
-                                                    self.pose.orientation.z,
-                                                    self.pose.orientation.w])
-        
-        
-        self.yaw = yaw # Store the yaw in a class variable
+        # Initialize Nav2 after receiving first pose
+        if not self.nav2_initialized:
+            self.navigator = BasicNavigator()
+            self.get_logger().info('Waiting for Nav2...')
+            self.navigator.waitUntilNav2Active()
+            self.get_logger().info('Nav2 activated successfully!')
+            
+            initial_pose = PoseStamped()
+            initial_pose.header.frame_id = 'map'
+            initial_pose.header.stamp = self.get_clock().now().to_msg()
+            initial_pose.pose = self.pose
+            self.navigator.setInitialPose(initial_pose)
+            self.nav2_initialized = True
 
     # Called every time scan_subscriber recieves a LaserScan message from the /scan topic
     #
