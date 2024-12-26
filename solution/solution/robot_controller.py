@@ -35,6 +35,9 @@ import angles
 from enum import Enum
 import random
 import math
+from nav2_simple_commander.robot_navigator import BasicNavigator
+from geometry_msgs.msg import PoseStamped
+from nav2_msgs.msg import TaskResult
 
 LINEAR_VELOCITY  = 0.3 # Metres per second
 ANGULAR_VELOCITY = 0.5 # Radians per second
@@ -54,12 +57,16 @@ class State(Enum):
     FORWARD = 0
     TURNING = 1
     COLLECTING = 2
+    OFFLOADING = 3  # New state for zone navigation
 
 
 class RobotController(Node):
 
     def __init__(self):
         super().__init__('robot_controller')
+        
+        self.navigator = BasicNavigator()
+        self.navigator.waitUntilNav2Active()
         
         # Class variables used to store persistent values between executions of callbacks and control loop
         self.state = State.FORWARD # Current FSM state
@@ -320,7 +327,7 @@ class RobotController(Node):
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Successfully picked up item!')
-                            self.state = State.FORWARD
+                            self.state = State.OFFLOADING
                         else:
                             self.get_logger().info('Failed to pick up item: ' + response.message)
                             # Move slightly closer if pickup failed
@@ -333,6 +340,44 @@ class RobotController(Node):
                     msg.linear.x = 0.25 * estimated_distance  # Proportional to distance
                     msg.angular.z = angle_to_item  # Proportional to angle offset
                     self.cmd_vel_publisher.publish(msg)
+            case State.OFFLOADING:
+                # Top left zone coordinates
+                goal_pose = PoseStamped()
+                goal_pose.header.frame_id = 'map'
+                goal_pose.header.stamp = self.get_clock().now().to_msg()
+                goal_pose.pose.position.x = 2.57
+                goal_pose.pose.position.y = 2.5
+                goal_pose.pose.orientation.w = 1.0
+
+                # If we haven't started navigation yet
+                if not hasattr(self, 'navigation_started') or not self.navigation_started:
+                    self.navigator.goToPose(goal_pose)
+                    self.navigation_started = True
+                    return
+
+                # Check if we've reached the goal
+                if self.navigator.isTaskComplete():
+                    result = self.navigator.getResult()
+                    
+                    if result == TaskResult.SUCCEEDED:
+                        # Try to offload
+                        rqt = ItemRequest.Request()
+                        rqt.robot_id = self.robot_id
+                        try:
+                            future = self.offload_service.call_async(rqt)
+                            rclpy.spin_until_future_complete(self, future)
+                            response = future.result()
+                            if response.success:
+                                self.get_logger().info('Successfully offloaded item!')
+                                self.state = State.FORWARD
+                                self.navigation_started = False
+                            else:
+                                self.get_logger().info('Failed to offload item: ' + response.message)
+                        except Exception as e:
+                            self.get_logger().info(f'Service call failed: {str(e)}')
+                    else:
+                        self.get_logger().info('Navigation failed, retrying...')
+                        self.navigation_started = False
             case _:
                 pass
         
