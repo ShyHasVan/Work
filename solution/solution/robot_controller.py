@@ -82,12 +82,12 @@ class RobotController(Node):
         client_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
 
-        self.pick_up_service = self.create_client(ItemRequest, '/item_sensor/pickup', callback_group=client_callback_group)
+        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
         self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
 
         self.item_subscriber = self.create_subscription(
             ItemList,
-            '/item_sensor/items',
+            'items',
             self.item_callback,
             10, callback_group=timer_callback_group
         )
@@ -300,12 +300,13 @@ class RobotController(Node):
 
                 # Calculate angle and distance to item
                 angle_to_item = math.atan2(item.y, item.x)
-                distance_to_item = math.sqrt(item.x * item.x + item.y * item.y)
+                # Use diameter for better distance estimation
+                estimated_distance = 32.4 * float(item.diameter) ** -0.75  # Empirically determined conversion
                 
-                self.get_logger().info(f'Item detected - Distance: {distance_to_item:.2f}m, Angle: {math.degrees(angle_to_item):.2f}°')
+                self.get_logger().info(f'Item detected - Distance: {estimated_distance:.2f}m, Angle: {math.degrees(angle_to_item):.2f}°')
 
                 # Stop if we're very close to attempt pickup
-                if distance_to_item < 0.2:  # Reduced from 0.4 to get closer
+                if estimated_distance < 0.35:  # Match DISTANCE in item_manager.py
                     msg.linear.x = 0.0
                     msg.angular.z = 0.0
                     self.cmd_vel_publisher.publish(msg)
@@ -320,23 +321,22 @@ class RobotController(Node):
                             self.get_logger().info('Successfully picked up item!')
                             self.state = State.FORWARD
                         else:
-                            self.get_logger().info('Failed to pick up item')
-                            # Move even closer if pickup failed
-                            msg.linear.x = 0.05  # Very slow forward instead of backing up
+                            self.get_logger().info('Failed to pick up item: ' + response.message)
+                            # Move slightly closer if pickup failed
+                            msg.linear.x = 0.05
                             self.cmd_vel_publisher.publish(msg)
-                            self.get_logger().info('Moving closer to try again')
                     except Exception as e:
                         self.get_logger().info(f'Service call failed: {str(e)}')
                 else:
                     # Not close enough yet, keep approaching
-                    if abs(angle_to_item) > 0.2:  # About 11.5 degrees
+                    if abs(angle_to_item) > 0.1:  # About 5.7 degrees
                         # Turn to face the item
-                        msg.angular.z = 0.3 if angle_to_item > 0 else -0.3
+                        msg.angular.z = 0.2 if angle_to_item > 0 else -0.2
                         msg.linear.x = 0.0
                     else:
                         # Move forward while keeping aligned
-                        msg.linear.x = min(0.15, distance_to_item)  # Slow down as we get closer
-                        msg.angular.z = 0.2 * angle_to_item  # Proportional correction
+                        msg.linear.x = min(0.15, estimated_distance)  # Slow down as we get closer
+                        msg.angular.z = 0.5 * angle_to_item  # Proportional correction
                 
                 self.cmd_vel_publisher.publish(msg)
             case _:
