@@ -25,7 +25,8 @@ from std_msgs.msg import Float32
 from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from auro_interfaces.msg import StringWithPose, Item, ItemList
+from assessment_interfaces.msg import Item, ItemList
+from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
 
 from tf_transformations import euler_from_quaternion
@@ -298,17 +299,18 @@ class RobotController(Node):
                 item = self.items.data[0]
                 msg = Twist()
 
-                # Calculate angle and distance to item
-                angle_to_item = math.atan2(item.y, item.x)
-                # Use diameter for better distance estimation
-                estimated_distance = 32.4 * float(item.diameter) ** -0.75  # Empirically determined conversion
+                # Convert from camera coordinates to robot-relative coordinates
+                # x is left/right in camera view (negative is right)
+                # y is up/down in camera view (negative is down)
+                angle_to_item = -math.atan2(item.x, item.y)  # Negative because camera x is opposite to robot rotation
+                estimated_distance = 32.4 * float(item.diameter) ** -0.75
+                self.get_logger().info(f'Estimated distance {estimated_distance}')
                 
                 self.get_logger().info(f'Item detected - Distance: {estimated_distance:.2f}m, Angle: {math.degrees(angle_to_item):.2f}°')
 
-                # Stop if we're very close to attempt pickup
-                if estimated_distance < 0.35:  # Match DISTANCE in item_manager.py
-                    msg.linear.x = 0.0
-                    msg.angular.z = 0.0
+                if estimated_distance < 0.35:  # DISTANCE from item_manager.py
+                    msg.linear.x = 0.25 * estimated_distance
+                    msg.angular.z = item.x / 320.0
                     self.cmd_vel_publisher.publish(msg)
                     
                     rqt = ItemRequest.Request()
