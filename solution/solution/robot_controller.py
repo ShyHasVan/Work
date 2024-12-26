@@ -296,8 +296,6 @@ class RobotController(Node):
                     return
                 
                 item = self.items.data[0]
-
-                # Adjust speed and turning based on item position
                 msg = Twist()
 
                 # Calculate angle and distance to item
@@ -306,33 +304,39 @@ class RobotController(Node):
                 
                 self.get_logger().info(f'Item detected - Distance: {distance_to_item:.2f}m, Angle: {math.degrees(angle_to_item):.2f}°')
 
-                # First, turn to face the item
-                if abs(angle_to_item) > 0.1:  # About 5.7 degrees tolerance
-                    msg.angular.z = 0.3 if angle_to_item > 0 else -0.3
+                # Stop if we're very close to attempt pickup
+                if distance_to_item < 0.2:  # Reduced from 0.4 to get closer
                     msg.linear.x = 0.0
-                else:
-                    # Once facing the item, move forward
                     msg.angular.z = 0.0
-                    if distance_to_item > 0.4:  # Stop a bit further away to ensure we're in range
-                        msg.linear.x = 0.15
-                    else:
-                        # We're close enough and facing the item, attempt pickup
+                    self.cmd_vel_publisher.publish(msg)
+                    
+                    rqt = ItemRequest.Request()
+                    rqt.robot_id = self.robot_id
+                    try:
+                        future = self.pick_up_service.call_async(rqt)
+                        rclpy.spin_until_future_complete(self, future)
+                        response = future.result()
+                        if response.success:
+                            self.get_logger().info('Successfully picked up item!')
+                            self.state = State.FORWARD
+                        else:
+                            self.get_logger().info('Failed to pick up item')
+                            # Move even closer if pickup failed
+                            msg.linear.x = 0.05  # Very slow forward instead of backing up
+                            self.cmd_vel_publisher.publish(msg)
+                            self.get_logger().info('Moving closer to try again')
+                    except Exception as e:
+                        self.get_logger().info(f'Service call failed: {str(e)}')
+                else:
+                    # Not close enough yet, keep approaching
+                    if abs(angle_to_item) > 0.2:  # About 11.5 degrees
+                        # Turn to face the item
+                        msg.angular.z = 0.3 if angle_to_item > 0 else -0.3
                         msg.linear.x = 0.0
-                        self.cmd_vel_publisher.publish(msg)
-                        
-                        rqt = ItemRequest.Request()
-                        rqt.robot_id = self.robot_id
-                        try:
-                            future = self.pick_up_service.call_async(rqt)
-                            rclpy.spin_until_future_complete(self, future)
-                            response = future.result()
-                            if response.success:
-                                self.get_logger().info('Successfully picked up item!')
-                                self.state = State.FORWARD
-                            else:
-                                self.get_logger().info('Failed to pick up item')
-                        except Exception as e:
-                            self.get_logger().info(f'Service call failed: {str(e)}')
+                    else:
+                        # Move forward while keeping aligned
+                        msg.linear.x = min(0.15, distance_to_item)  # Slow down as we get closer
+                        msg.angular.z = 0.2 * angle_to_item  # Proportional correction
                 
                 self.cmd_vel_publisher.publish(msg)
             case _:
