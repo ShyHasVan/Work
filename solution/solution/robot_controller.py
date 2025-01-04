@@ -67,12 +67,19 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Initialize Nav2
-        self.navigator = BasicNavigator()
+        # Class variables first
+        self.pose = Pose()
+        self.previous_pose = Pose()
+        self.yaw = 0.0
+        self.previous_yaw = 0.0
+        self.turn_angle = 0.0
+        self.turn_direction = TURN_LEFT
+        self.goal_distance = random.uniform(1.0, 2.0)
+        self.scan_triggered = [False] * 4
+        self.items = ItemList()
         
-        # Add TF2 listener for navigation
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        # Initialize Nav2 after variables
+        self.navigator = BasicNavigator()
         
         # Set initial pose
         initial_pose = PoseStamped()
@@ -80,28 +87,20 @@ class RobotController(Node):
         initial_pose.header.stamp = self.get_clock().now().to_msg()
         initial_pose.pose.position.x = 0.0
         initial_pose.pose.position.y = 0.0
+        initial_pose.pose.orientation.w = 1.0
         
-        # Set proper orientation
-        (initial_pose.pose.orientation.x,
-         initial_pose.pose.orientation.y,
-         initial_pose.pose.orientation.z,
-         initial_pose.pose.orientation.w) = quaternion_from_euler(0, 0, 0)
-        
+        # Set initial pose before waiting
         self.navigator.setInitialPose(initial_pose)
-        self.navigator.waitUntilNav2Active()
         
-        # Class variables used to store persistent values between executions of callbacks and control loop
-        self.state = State.FORWARD # Current FSM state
-        self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
-        self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
-        self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
-        self.previous_yaw = 0.0 # Snapshot of the angle for comparison against future angles
-        self.turn_angle = 0.0 # Relative angle to turn to in the TURNING state
-        self.turn_direction = TURN_LEFT # Direction to turn in the TURNING state
-        self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
-        self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
-        self.items = ItemList()
-
+        # Wait for Nav2 to be ready
+        self.get_logger().info('Waiting for Nav2...')
+        self.navigator.waitUntilNav2Active()
+        self.get_logger().info('Nav2 activated successfully!')
+        
+        # Add TF2 listener for navigation
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
 
@@ -363,27 +362,18 @@ class RobotController(Node):
                     msg.angular.z = angle_to_item  # Proportional to angle offset
                     self.cmd_vel_publisher.publish(msg)
             case State.OFFLOADING:
-                # Set goal pose for the zone
-                goal_pose = PoseStamped()
-                goal_pose.header.frame_id = 'map'
-                goal_pose.header.stamp = self.get_clock().now().to_msg()
-                
-                # TOP_LEFT zone coordinates
-                goal_pose.pose.position.x = 2.57
-                goal_pose.pose.position.y = 2.5
-                
-                # Set orientation with a specific angle (90 degrees to face the zone)
-                (goal_pose.pose.orientation.x,
-                 goal_pose.pose.orientation.y,
-                 goal_pose.pose.orientation.z,
-                 goal_pose.pose.orientation.w) = quaternion_from_euler(0, 0, math.pi/2)
-
-                # If navigation hasn't started yet
                 if not hasattr(self, 'navigation_started') or not self.navigation_started:
+                    # Set goal pose for the zone
+                    goal_pose = PoseStamped()
+                    goal_pose.header.frame_id = 'map'
+                    goal_pose.header.stamp = self.get_clock().now().to_msg()
+                    
+                    # TOP_LEFT zone coordinates
+                    goal_pose.pose.position.x = 2.57
+                    goal_pose.pose.position.y = 2.5
+                    goal_pose.pose.orientation.w = 1.0
+                    
                     self.get_logger().info(f'Starting navigation to zone at ({goal_pose.pose.position.x}, {goal_pose.pose.position.y})')
-                    # Clear any previous navigation tasks
-                    self.navigator.cancelTask()
-                    # Start new navigation
                     self.navigator.goToPose(goal_pose)
                     self.navigation_started = True
                     return
@@ -406,35 +396,17 @@ class RobotController(Node):
                                 self.navigation_started = False
                             else:
                                 self.get_logger().info('Failed to offload item: ' + response.message)
-                                # If offload fails, try moving slightly and retry
-                                msg = Twist()
-                                msg.linear.x = 0.1
-                                self.cmd_vel_publisher.publish(msg)
                         except Exception as e:
                             self.get_logger().info(f'Service call failed: {str(e)}')
                     else:
                         self.get_logger().warn(f'Navigation failed with result: {result}')
                         self.navigation_started = False
-                        # If navigation fails, return to FORWARD state and try again later
                         self.state = State.FORWARD
                 else:
                     # Still navigating, provide feedback
                     feedback = self.navigator.getFeedback()
-                    if feedback and feedback.distance_remaining:
+                    if feedback:
                         self.get_logger().info(f'Distance remaining: {feedback.distance_remaining:.2f}m')
-                        
-                        # If stuck for too long, cancel and retry
-                        if hasattr(self, 'last_distance') and self.last_distance == feedback.distance_remaining:
-                            self.stuck_count = getattr(self, 'stuck_count', 0) + 1
-                            if self.stuck_count > 50:  # About 5 seconds stuck
-                                self.get_logger().warn('Navigation appears stuck, cancelling and retrying')
-                                self.navigator.cancelTask()
-                                self.navigation_started = False
-                                self.state = State.FORWARD
-                                return
-                        else:
-                            self.stuck_count = 0
-                        self.last_distance = feedback.distance_remaining
             case _:
                 pass
         
