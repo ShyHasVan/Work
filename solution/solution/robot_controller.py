@@ -1,3 +1,4 @@
+
 #
 # Copyright (c) 2024 University of York and others
 #
@@ -29,16 +30,12 @@ from assessment_interfaces.msg import Item, ItemList
 from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
 
-from tf_transformations import euler_from_quaternion, quaternion_from_euler
+from tf_transformations import euler_from_quaternion
 import angles
 
 from enum import Enum
 import random
 import math
-from nav2_simple_commander.robot_navigator import BasicNavigator
-from geometry_msgs.msg import PoseStamped
-from nav2_msgs.msg import TaskResult
-from tf2_ros import Buffer, TransformListener
 
 LINEAR_VELOCITY  = 0.3 # Metres per second
 ANGULAR_VELOCITY = 0.5 # Radians per second
@@ -58,7 +55,6 @@ class State(Enum):
     FORWARD = 0
     TURNING = 1
     COLLECTING = 2
-    OFFLOADING = 3  # New state for zone navigation
 
 
 class RobotController(Node):
@@ -66,35 +62,18 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Initialize Nav2
-        self.navigator = BasicNavigator()
-        
-        # Class variables first
-        self.pose = Pose()
-        self.previous_pose = Pose()
-        self.yaw = 0.0
-        self.previous_yaw = 0.0
-        self.turn_angle = 0.0
-        self.turn_direction = TURN_LEFT
-        self.goal_distance = random.uniform(1.0, 2.0)
-        self.scan_triggered = [False] * 4
+        # Class variables used to store persistent values between executions of callbacks and control loop
+        self.state = State.FORWARD # Current FSM state
+        self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
+        self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
+        self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
+        self.previous_yaw = 0.0 # Snapshot of the angle for comparison against future angles
+        self.turn_angle = 0.0 # Relative angle to turn to in the TURNING state
+        self.turn_direction = TURN_LEFT # Direction to turn in the TURNING state
+        self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
+        self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
         self.items = ItemList()
-        
-        # Set initial pose
-        initial_pose = PoseStamped()
-        initial_pose.header.frame_id = 'map'
-        initial_pose.header.stamp = self.get_clock().now().to_msg()
-        initial_pose.pose.position.x = 0.0
-        initial_pose.pose.position.y = 0.0
-        initial_pose.pose.orientation.w = 1.0
-        
-        self.navigator.setInitialPose(initial_pose)
-        self.navigator.waitUntilNav2Active()
-        
-        # Add TF2 listener
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-        
+
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
 
@@ -182,15 +161,19 @@ class RobotController(Node):
     #
     # The pose estimates are expressed in a coordinate system relative to the starting pose of the robot
     def odom_callback(self, msg):
-        self.pose = msg.pose.pose
+        self.pose = msg.pose.pose # Store the pose in a class variable
+
+        # Uses tf_transformations package to convert orientation from quaternion to Euler angles (RPY = roll, pitch, yaw)
+        # https://github.com/DLu/tf_transformations
+        #
+        # Roll (rotation around X axis) and pitch (rotation around Y axis) are discarded
+        (roll, pitch, yaw) = euler_from_quaternion([self.pose.orientation.x,
+                                                    self.pose.orientation.y,
+                                                    self.pose.orientation.z,
+                                                    self.pose.orientation.w])
         
-        (roll, pitch, yaw) = euler_from_quaternion([
-            self.pose.orientation.x,
-            self.pose.orientation.y,
-            self.pose.orientation.z,
-            self.pose.orientation.w])
         
-        self.yaw = yaw
+        self.yaw = yaw # Store the yaw in a class variable
 
     # Called every time scan_subscriber recieves a LaserScan message from the /scan topic
     #
@@ -338,7 +321,7 @@ class RobotController(Node):
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Successfully picked up item!')
-                            self.state = State.OFFLOADING
+                            self.state = State.FORWARD
                         else:
                             self.get_logger().info('Failed to pick up item: ' + response.message)
                             # Move slightly closer if pickup failed
@@ -351,56 +334,6 @@ class RobotController(Node):
                     msg.linear.x = 0.25 * estimated_distance  # Proportional to distance
                     msg.angular.z = angle_to_item  # Proportional to angle offset
                     self.cmd_vel_publisher.publish(msg)
-            case State.OFFLOADING:
-                # Top left zone coordinates
-                goal_pose = PoseStamped()
-                goal_pose.header.frame_id = 'map'
-                goal_pose.header.stamp = self.get_clock().now().to_msg()
-                goal_pose.pose.position.x = 2.57
-                goal_pose.pose.position.y = 2.5
-                
-                # Add proper orientation
-                (goal_pose.pose.orientation.x,
-                 goal_pose.pose.orientation.y,
-                 goal_pose.pose.orientation.z,
-                 goal_pose.pose.orientation.w) = quaternion_from_euler(0, 0, 0, axes='sxyz')
-
-                # If we haven't started navigation yet
-                if not hasattr(self, 'navigation_started') or not self.navigation_started:
-                    self.get_logger().info(f'Starting navigation to zone at ({goal_pose.pose.position.x}, {goal_pose.pose.position.y})')
-                    self.navigator.goToPose(goal_pose)
-                    self.navigation_started = True
-                    return
-
-                # Check if navigation is complete
-                if self.navigator.isTaskComplete():
-                    result = self.navigator.getResult()
-                    
-                    if result == TaskResult.SUCCEEDED:
-                        self.get_logger().info('Reached zone, attempting to offload')
-                        rqt = ItemRequest.Request()
-                        rqt.robot_id = self.robot_id
-                        try:
-                            future = self.offload_service.call_async(rqt)
-                            rclpy.spin_until_future_complete(self, future)
-                            response = future.result()
-                            if response.success:
-                                self.get_logger().info('Successfully offloaded item!')
-                                self.state = State.FORWARD
-                                self.navigation_started = False
-                            else:
-                                self.get_logger().info('Failed to offload item: ' + response.message)
-                        except Exception as e:
-                            self.get_logger().info(f'Service call failed: {str(e)}')
-                    else:
-                        self.get_logger().warn(f'Navigation failed with result: {result}')
-                        self.navigation_started = False
-                        self.state = State.FORWARD
-                else:
-                    # Still navigating, provide feedback
-                    feedback = self.navigator.getFeedback()
-                    if feedback:
-                        self.get_logger().info(f'Distance remaining: {feedback.distance_remaining:.2f}m')
             case _:
                 pass
         
