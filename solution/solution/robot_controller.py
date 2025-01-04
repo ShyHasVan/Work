@@ -66,40 +66,10 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Add TF2 listener
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-        
         # Initialize Nav2
         self.navigator = BasicNavigator()
         
-        # Set initial pose first
-        initial_pose = PoseStamped()
-        initial_pose.header.frame_id = 'map'
-        initial_pose.header.stamp = self.get_clock().now().to_msg()
-        initial_pose.pose.position.x = 0.0
-        initial_pose.pose.position.y = 0.0
-        
-        # Add proper orientation using quaternion
-        (initial_pose.pose.orientation.x,
-         initial_pose.pose.orientation.y,
-         initial_pose.pose.orientation.z,
-         initial_pose.pose.orientation.w) = quaternion_from_euler(0, 0, 0, axes='sxyz')
-        
-        self.navigator.setInitialPose(initial_pose)
-        
-        # Then wait for Nav2 with timeout
-        try:
-            self.get_logger().info('Waiting for Nav2...')
-            self.navigator.waitUntilNav2Active()  # Remove timeout for initial startup
-            self.get_logger().info('Nav2 activated successfully!')
-        except Exception as e:
-            self.get_logger().error(f'Error waiting for Nav2: {str(e)}')
-            rclpy.shutdown()
-            return
-
-        
-        # Class variables
+        # Class variables first
         self.pose = Pose()
         self.previous_pose = Pose()
         self.yaw = 0.0
@@ -109,6 +79,21 @@ class RobotController(Node):
         self.goal_distance = random.uniform(1.0, 2.0)
         self.scan_triggered = [False] * 4
         self.items = ItemList()
+        
+        # Set initial pose
+        initial_pose = PoseStamped()
+        initial_pose.header.frame_id = 'map'
+        initial_pose.header.stamp = self.get_clock().now().to_msg()
+        initial_pose.pose.position.x = 0.0
+        initial_pose.pose.position.y = 0.0
+        initial_pose.pose.orientation.w = 1.0
+        
+        self.navigator.setInitialPose(initial_pose)
+        self.navigator.waitUntilNav2Active()
+        
+        # Add TF2 listener
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
