@@ -29,7 +29,7 @@ from assessment_interfaces.msg import Item, ItemList
 from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
 
-from tf_transformations import euler_from_quaternion
+from tf_transformations import euler_from_quaternion, quaternion_from_euler
 import angles
 
 from enum import Enum
@@ -38,6 +38,7 @@ import math
 from nav2_simple_commander.robot_navigator import BasicNavigator
 from geometry_msgs.msg import PoseStamped
 from nav2_msgs.msg import TaskResult
+from tf2_ros import Buffer, TransformListener
 
 LINEAR_VELOCITY  = 0.3 # Metres per second
 ANGULAR_VELOCITY = 0.5 # Radians per second
@@ -65,6 +66,10 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
+        # Add TF2 listener
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        
         # Initialize Nav2
         self.navigator = BasicNavigator()
         
@@ -74,7 +79,14 @@ class RobotController(Node):
         initial_pose.header.stamp = self.get_clock().now().to_msg()
         initial_pose.pose.position.x = 0.0
         initial_pose.pose.position.y = 0.0
-        initial_pose.pose.orientation.w = 1.0
+        initial_pose.pose.orientation.w = 0.0
+        
+        # Add proper orientation using quaternion
+        (initial_pose.pose.orientation.x,
+        initial_pose.pose.orientation.y,
+        initial_pose.pose.orientation.z,
+        initial_pose.pose.orientation.w) = quaternion_from_euler(0, 0, 0, axes='sxyz')
+    
         self.navigator.setInitialPose(initial_pose)
         
         # Then wait for Nav2 with timeout
@@ -90,6 +102,10 @@ class RobotController(Node):
             rclpy.shutdown()
             return
 
+        # Add TF2 listener
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        
         # Class variables
         self.pose = Pose()
         self.previous_pose = Pose()
@@ -364,7 +380,12 @@ class RobotController(Node):
                 goal_pose.header.stamp = self.get_clock().now().to_msg()
                 goal_pose.pose.position.x = 2.57
                 goal_pose.pose.position.y = 2.5
-                goal_pose.pose.orientation.w = 1.0
+                
+                # Add proper orientation
+                (goal_pose.pose.orientation.x,
+                 goal_pose.pose.orientation.y,
+                 goal_pose.pose.orientation.z,
+                 goal_pose.pose.orientation.w) = quaternion_from_euler(0, 0, 0, axes='sxyz')
 
                 # If we haven't started navigation yet
                 if not hasattr(self, 'navigation_started') or not self.navigation_started:
