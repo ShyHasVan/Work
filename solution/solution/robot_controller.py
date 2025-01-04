@@ -372,15 +372,18 @@ class RobotController(Node):
                 goal_pose.pose.position.x = 2.57
                 goal_pose.pose.position.y = 2.5
                 
-                # Set orientation
+                # Set orientation with a specific angle (90 degrees to face the zone)
                 (goal_pose.pose.orientation.x,
                  goal_pose.pose.orientation.y,
                  goal_pose.pose.orientation.z,
-                 goal_pose.pose.orientation.w) = quaternion_from_euler(0, 0, 0)
+                 goal_pose.pose.orientation.w) = quaternion_from_euler(0, 0, math.pi/2)
 
                 # If navigation hasn't started yet
                 if not hasattr(self, 'navigation_started') or not self.navigation_started:
                     self.get_logger().info(f'Starting navigation to zone at ({goal_pose.pose.position.x}, {goal_pose.pose.position.y})')
+                    # Clear any previous navigation tasks
+                    self.navigator.cancelTask()
+                    # Start new navigation
                     self.navigator.goToPose(goal_pose)
                     self.navigation_started = True
                     return
@@ -403,17 +406,35 @@ class RobotController(Node):
                                 self.navigation_started = False
                             else:
                                 self.get_logger().info('Failed to offload item: ' + response.message)
+                                # If offload fails, try moving slightly and retry
+                                msg = Twist()
+                                msg.linear.x = 0.1
+                                self.cmd_vel_publisher.publish(msg)
                         except Exception as e:
                             self.get_logger().info(f'Service call failed: {str(e)}')
                     else:
                         self.get_logger().warn(f'Navigation failed with result: {result}')
                         self.navigation_started = False
+                        # If navigation fails, return to FORWARD state and try again later
                         self.state = State.FORWARD
                 else:
                     # Still navigating, provide feedback
                     feedback = self.navigator.getFeedback()
-                    if feedback:
+                    if feedback and feedback.distance_remaining:
                         self.get_logger().info(f'Distance remaining: {feedback.distance_remaining:.2f}m')
+                        
+                        # If stuck for too long, cancel and retry
+                        if hasattr(self, 'last_distance') and self.last_distance == feedback.distance_remaining:
+                            self.stuck_count = getattr(self, 'stuck_count', 0) + 1
+                            if self.stuck_count > 50:  # About 5 seconds stuck
+                                self.get_logger().warn('Navigation appears stuck, cancelling and retrying')
+                                self.navigator.cancelTask()
+                                self.navigation_started = False
+                                self.state = State.FORWARD
+                                return
+                        else:
+                            self.stuck_count = 0
+                        self.last_distance = feedback.distance_remaining
             case _:
                 pass
         
