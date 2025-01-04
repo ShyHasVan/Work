@@ -354,33 +354,52 @@ class RobotController(Node):
                     msg.angular.z = angle_to_item  # Proportional to angle offset
                     self.cmd_vel_publisher.publish(msg)
             case State.OFFLOADING:
-                # Set goal pose for the zone
-                goal_pose = PoseStamped()
-                goal_pose.header.frame_id = 'map'
-                goal_pose.header.stamp = self.get_clock().now().to_msg()
+                if not hasattr(self, 'navigation_started') or not self.navigation_started:
+                    # Set goal pose for the zone
+                    goal_pose = PoseStamped()
+                    goal_pose.header.frame_id = 'map'
+                    goal_pose.header.stamp = self.get_clock().now().to_msg()
+                    
+                    # TOP_LEFT zone coordinates
+                    goal_pose.pose.position.x = 2.57
+                    goal_pose.pose.position.y = 2.5
+                    goal_pose.pose.orientation.w = 1.0
+                    
+                    self.get_logger().info(f'Starting navigation to zone')
+                    self.navigator.goToPose(goal_pose)
+                    self.navigation_started = True
+                    return
+
+                # Check if we're still navigating
+                if not self.navigator.isTaskComplete():
+                    feedback = self.navigator.getFeedback()
+                    if feedback:
+                        self.get_logger().info(f'Distance remaining: {feedback.distance_remaining:.2f}m')
+                    return
+                    
+                # Navigation is complete, check result
+                result = self.navigator.getResult()
                 
-                # TOP_LEFT zone coordinates
-                goal_pose.pose.position.x = 2.57
-                goal_pose.pose.position.y = 2.5
-                goal_pose.pose.orientation.w = 1.0
-                
-                # Try to navigate to zone
-                self.navigator.goToPose(goal_pose)
-                
-                # Try to offload
-                rqt = ItemRequest.Request()
-                rqt.robot_id = self.robot_id
-                try:
-                    future = self.offload_service.call_async(rqt)
-                    rclpy.spin_until_future_complete(self, future)
-                    response = future.result()
-                    if response.success:
-                        self.get_logger().info('Successfully offloaded item!')
-                        self.state = State.FORWARD
-                    else:
-                        self.get_logger().info('Failed to offload item: ' + response.message)
-                except Exception as e:
-                    self.get_logger().info(f'Service call failed: {str(e)}')
+                if result == TaskResult.SUCCEEDED:
+                    # Try to offload
+                    rqt = ItemRequest.Request()
+                    rqt.robot_id = self.robot_id
+                    try:
+                        future = self.offload_service.call_async(rqt)
+                        rclpy.spin_until_future_complete(self, future)
+                        response = future.result()
+                        if response.success:
+                            self.get_logger().info('Successfully offloaded item!')
+                            self.navigation_started = False
+                            self.state = State.FORWARD
+                        else:
+                            self.get_logger().info('Failed to offload item: ' + response.message)
+                    except Exception as e:
+                        self.get_logger().info(f'Service call failed: {str(e)}')
+                else:
+                    self.get_logger().warn(f'Navigation failed with result: {result}')
+                    self.navigation_started = False
+                    self.state = State.FORWARD
             case _:
                 pass
         
