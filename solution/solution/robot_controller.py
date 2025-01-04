@@ -79,32 +79,25 @@ class RobotController(Node):
         initial_pose.header.stamp = self.get_clock().now().to_msg()
         initial_pose.pose.position.x = 0.0
         initial_pose.pose.position.y = 0.0
-        initial_pose.pose.orientation.w = 0.0
         
         # Add proper orientation using quaternion
         (initial_pose.pose.orientation.x,
-        initial_pose.pose.orientation.y,
-        initial_pose.pose.orientation.z,
-        initial_pose.pose.orientation.w) = quaternion_from_euler(0, 0, 0, axes='sxyz')
-    
+         initial_pose.pose.orientation.y,
+         initial_pose.pose.orientation.z,
+         initial_pose.pose.orientation.w) = quaternion_from_euler(0, 0, 0, axes='sxyz')
+        
         self.navigator.setInitialPose(initial_pose)
         
         # Then wait for Nav2 with timeout
         try:
             self.get_logger().info('Waiting for Nav2...')
-            if not self.navigator.waitUntilNav2Active(timeout_sec=10.0):
-                self.get_logger().error('Nav2 did not become active within timeout!')
-                rclpy.shutdown()
-                return
+            self.navigator.waitUntilNav2Active()  # Remove timeout for initial startup
             self.get_logger().info('Nav2 activated successfully!')
         except Exception as e:
             self.get_logger().error(f'Error waiting for Nav2: {str(e)}')
             rclpy.shutdown()
             return
 
-        # Add TF2 listener
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
         
         # Class variables
         self.pose = Pose()
