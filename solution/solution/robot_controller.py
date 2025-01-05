@@ -77,7 +77,21 @@ class RobotController(Node):
         self.goal_distance = random.uniform(1.0, 2.0)
         self.scan_triggered = [False] * 4
         self.items = ItemList()
-        self.nav2_initialized = False
+        
+        # Initialize Nav2 immediately
+        self.navigator = BasicNavigator()
+        
+        # Set initial pose
+        initial_pose = PoseStamped()
+        initial_pose.header.frame_id = 'map'
+        initial_pose.header.stamp = self.get_clock().now().to_msg()
+        initial_pose.pose.position.x = 0.0
+        initial_pose.pose.position.y = 0.0
+        initial_pose.pose.orientation.w = 1.0
+        
+        # Set initial pose and wait for Nav2
+        self.navigator.setInitialPose(initial_pose)
+        self.navigator.waitUntilNav2Active()
         
         # Rest of initialization (services, subscribers, etc.)
         self.declare_parameter('robot_id', 'robot1')
@@ -341,11 +355,6 @@ class RobotController(Node):
                     msg.angular.z = angle_to_item  # Proportional to angle offset
                     self.cmd_vel_publisher.publish(msg)
             case State.OFFLOADING:
-                # Initialize Nav2 if not already done
-                if not hasattr(self, 'nav2_initialized') or not self.nav2_initialized:
-                    self.init_nav2()
-                    return
-                
                 # Set goal pose for the zone
                 goal_pose = PoseStamped()
                 goal_pose.header.frame_id = 'map'
@@ -399,23 +408,6 @@ class RobotController(Node):
         self.cmd_vel_publisher.publish(msg)
         self.get_logger().info(f"Stopping: {msg}")
         super().destroy_node()
-
-    def init_nav2(self):
-        if not self.nav2_initialized:
-            self.navigator = BasicNavigator()
-            
-            # Set initial pose
-            initial_pose = PoseStamped()
-            initial_pose.header.frame_id = 'map'
-            initial_pose.header.stamp = self.get_clock().now().to_msg()
-            initial_pose.pose.position.x = 0.0
-            initial_pose.pose.position.y = 0.0
-            initial_pose.pose.orientation.w = 1.0
-            
-            self.navigator.setInitialPose(initial_pose)
-            self.navigator.waitUntilNav2Active()
-            self.nav2_initialized = True
-            self.get_logger().info('Nav2 initialized successfully!')
 
 
 def main(args=None):
