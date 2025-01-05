@@ -36,6 +36,7 @@ from tf_transformations import euler_from_quaternion, quaternion_from_euler
 import angles
 
 from enum import Enum
+from tf2_ros import Buffer, TransformListener, TransformException
 
 LINEAR_VELOCITY  = 0.3 # Metres per second
 ANGULAR_VELOCITY = 0.5 # Radians per second
@@ -415,15 +416,38 @@ class RobotController(Node):
         if self.navigator is None:
             self.navigator = BasicNavigator()
             
-            # Set initial pose
-            initial_pose = PoseStamped()
-            initial_pose.header.frame_id = 'map'
-            initial_pose.header.stamp = self.get_clock().now().to_msg()
-            initial_pose.pose = self.pose  # Use current robot pose
+            # Create transform buffer and listener
+            self.tf_buffer = Buffer()
+            self.tf_listener = TransformListener(self.tf_buffer, self)
             
-            self.navigator.setInitialPose(initial_pose)
-            self.navigator.waitUntilNav2Active()
-            return True
+            # Wait for transform to be available
+            try:
+                self.get_logger().info('Waiting for transform...')
+                # Wait for transform between map and base_link
+                while not self.tf_buffer.can_transform('map', 'base_link', rclpy.time.Time()):
+                    self.get_logger().info('Waiting for transform between map and base_link...')
+                    rclpy.sleep(1.0)
+                
+                # Get the current transform
+                transform = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+                
+                # Set initial pose using the transform
+                initial_pose = PoseStamped()
+                initial_pose.header.frame_id = 'map'
+                initial_pose.header.stamp = self.get_clock().now().to_msg()
+                initial_pose.pose.position.x = transform.transform.translation.x
+                initial_pose.pose.position.y = transform.transform.translation.y
+                initial_pose.pose.orientation = transform.transform.rotation
+                
+                self.navigator.setInitialPose(initial_pose)
+                self.navigator.waitUntilNav2Active()
+                self.get_logger().info('Nav2 initialized successfully')
+                return True
+                
+            except TransformException as ex:
+                self.get_logger().error(f'Could not transform: {str(ex)}')
+                return False
+                
         return False
 
 def main(args=None):
