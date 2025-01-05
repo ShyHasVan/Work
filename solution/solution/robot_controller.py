@@ -75,8 +75,20 @@ class RobotController(Node):
         self.scan_triggered = [False] * 4
         self.items = ItemList()
         
-        # Initialize Nav2
-        self.navigator = BasicNavigator()
+        # Initialize Nav2 later when needed
+        self.navigator = None
+        
+        # Create callback groups
+        client_callback_group = MutuallyExclusiveCallbackGroup()
+        timer_callback_group = MutuallyExclusiveCallbackGroup()
+        
+        # Initialize publishers
+        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.marker_publisher = self.create_publisher(StringWithPose, 'rviz_text_marker', 10)
+        
+        # Initialize timer (needed for control loop)
+        self.timer_period = 0.1
+        self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
         
         # Rest of initialization (services, subscribers, etc.)
         self.declare_parameter('robot_id', 'robot1')
