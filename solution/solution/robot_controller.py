@@ -95,35 +95,44 @@ class RobotController(Node):
         timer_callback_group = MutuallyExclusiveCallbackGroup()
         
         # Publishers
-        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
         self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10)
         
         # Subscribers
         self.odom_subscriber = self.create_subscription(
-            Odometry, 'odom', self.odom_callback, 
+            Odometry,
+            '/odom',
+            self.odom_callback,
             QoSPresetProfiles.SENSOR_DATA.value,
             callback_group=timer_callback_group
         )
         
         self.scan_subscriber = self.create_subscription(
-            LaserScan, 'scan', self.scan_callback,
+            LaserScan,
+            '/scan',
+            self.scan_callback,
             QoSPresetProfiles.SENSOR_DATA.value,
             callback_group=timer_callback_group
         )
         
         self.item_subscriber = self.create_subscription(
-            ItemList, 'items', self.item_callback, 
-            10, callback_group=timer_callback_group
+            ItemList,
+            '/items',
+            self.item_callback,
+            10,
+            callback_group=timer_callback_group
         )
         
         # Services
         self.pick_up_service = self.create_client(
-            ItemRequest, '/pick_up_item',
+            ItemRequest,
+            '/pick_up_item',
             callback_group=client_callback_group
         )
         
         self.offload_service = self.create_client(
-            ItemRequest, '/offload_item',
+            ItemRequest,
+            '/offload_item',
             callback_group=client_callback_group
         )
         
