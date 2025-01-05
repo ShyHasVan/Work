@@ -87,11 +87,20 @@ class RobotController(Node):
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
         self.marker_publisher = self.create_publisher(StringWithPose, 'rviz_text_marker', 10)
         
+        # Initialize subscribers
+        self.odom_subscriber = self.create_subscription(Odometry, 'odom', self.odom_callback, QoSPresetProfiles.SENSOR_DATA.value)
+        self.scan_subscriber = self.create_subscription(LaserScan, 'scan', self.scan_callback, QoSPresetProfiles.SENSOR_DATA.value)
+        self.items_subscriber = self.create_subscription(ItemList, 'items', self.items_callback, 10)
+        
+        # Initialize services
+        self.pick_up_service = self.create_client(ItemRequest, 'pick_up_item', callback_group=client_callback_group)
+        self.offload_service = self.create_client(ItemRequest, 'offload_item', callback_group=client_callback_group)
+        
         # Initialize timer (needed for control loop)
         self.timer_period = 0.1
         self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
         
-        # Rest of initialization (services, subscribers, etc.)
+        # Parameters
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
 
