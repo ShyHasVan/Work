@@ -78,23 +78,6 @@ class RobotController(Node):
         # Initialize Nav2
         self.navigator = BasicNavigator()
         
-        # Set initial pose
-        initial_pose = PoseStamped()
-        initial_pose.header.frame_id = 'map'
-        initial_pose.header.stamp = self.get_clock().now().to_msg()
-        initial_pose.pose.position.x = 0.0
-        initial_pose.pose.position.y = 0.0
-        
-        # Set orientation using quaternion
-        q = quaternion_from_euler(0.0, 0.0, 0.0)  # RPY = 0, 0, 0
-        initial_pose.pose.orientation.x = q[0]
-        initial_pose.pose.orientation.y = q[1]
-        initial_pose.pose.orientation.z = q[2]
-        initial_pose.pose.orientation.w = q[3]
-        
-        self.navigator.setInitialPose(initial_pose)
-        self.navigator.waitUntilNav2Active()
-        
         # Rest of initialization (services, subscribers, etc.)
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
@@ -357,20 +340,27 @@ class RobotController(Node):
                     msg.angular.z = angle_to_item  # Proportional to angle offset
                     self.cmd_vel_publisher.publish(msg)
             case State.OFFLOADING:
+                # Initialize Nav2 if needed
+                if self.navigator is None:
+                    if self.init_navigation():
+                        self.get_logger().info('Nav2 initialized')
+                    return
+                
+                # Set goal pose for the zone
+                goal_pose = PoseStamped()
+                goal_pose.header.frame_id = 'map'
+                goal_pose.header.stamp = self.get_clock().now().to_msg()
+                goal_pose.pose.position.x = 2.57
+                goal_pose.pose.position.y = 2.5
+                goal_pose.pose.orientation.w = 1.0
+                
+                # Start navigation if not already started
                 if not hasattr(self, 'nav_started'):
-                    # Set goal pose for the zone
-                    goal_pose = PoseStamped()
-                    goal_pose.header.frame_id = 'map'
-                    goal_pose.header.stamp = self.get_clock().now().to_msg()
-                    goal_pose.pose.position.x = 2.57
-                    goal_pose.pose.position.y = 2.5
-                    goal_pose.pose.orientation.w = 1.0
-                    
                     self.get_logger().info('Starting navigation to zone')
                     self.navigator.goToPose(goal_pose)
                     self.nav_started = True
                     return
-
+                
                 # Check if we've reached the goal
                 if self.navigator.isTaskComplete():
                     result = self.navigator.getResult()
@@ -401,6 +391,12 @@ class RobotController(Node):
         self.get_logger().info(f"Stopping: {msg}")
         super().destroy_node()
 
+    def init_navigation(self):
+        if self.navigator is None:
+            self.navigator = BasicNavigator()
+            self.navigator.waitUntilNav2Active()
+            return True
+        return False
 
 def main(args=None):
 
