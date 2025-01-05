@@ -13,6 +13,8 @@
 #
  
 import sys
+import random
+import math
 
 import rclpy
 from rclpy.node import Node
@@ -20,26 +22,20 @@ from rclpy.signals import SignalHandlerOptions
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.qos import QoSPresetProfiles
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.duration import Duration
 
-from std_msgs.msg import Float32
-from geometry_msgs.msg import Twist, Pose
+from geometry_msgs.msg import Twist, Pose, PoseStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from assessment_interfaces.msg import Item, ItemList
 from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
 
-from tf_transformations import euler_from_quaternion
+from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
+from tf_transformations import euler_from_quaternion, quaternion_from_euler
 import angles
 
 from enum import Enum
-import random
-import math
-
-from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
-from tf2_ros import Buffer, TransformListener
-from geometry_msgs.msg import PoseStamped
-from tf_transformations import quaternion_from_euler
 
 LINEAR_VELOCITY  = 0.3 # Metres per second
 ANGULAR_VELOCITY = 0.5 # Radians per second
@@ -67,8 +63,8 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Class variables first
-        self.state = State.FORWARD  # Initialize state
+        # Class variables
+        self.state = State.FORWARD
         self.pose = Pose()
         self.previous_pose = Pose()
         self.yaw = 0.0
@@ -88,7 +84,13 @@ class RobotController(Node):
         initial_pose.header.stamp = self.get_clock().now().to_msg()
         initial_pose.pose.position.x = 0.0
         initial_pose.pose.position.y = 0.0
-        initial_pose.pose.orientation.w = 1.0
+        
+        # Set orientation using quaternion
+        q = quaternion_from_euler(0.0, 0.0, 0.0)  # RPY = 0, 0, 0
+        initial_pose.pose.orientation.x = q[0]
+        initial_pose.pose.orientation.y = q[1]
+        initial_pose.pose.orientation.z = q[2]
+        initial_pose.pose.orientation.w = q[3]
         
         self.navigator.setInitialPose(initial_pose)
         self.navigator.waitUntilNav2Active()
@@ -355,23 +357,20 @@ class RobotController(Node):
                     msg.angular.z = angle_to_item  # Proportional to angle offset
                     self.cmd_vel_publisher.publish(msg)
             case State.OFFLOADING:
-                # Set goal pose for the zone
-                goal_pose = PoseStamped()
-                goal_pose.header.frame_id = 'map'
-                goal_pose.header.stamp = self.get_clock().now().to_msg()
-                
-                # TOP_LEFT zone coordinates
-                goal_pose.pose.position.x = 2.57
-                goal_pose.pose.position.y = 2.5
-                goal_pose.pose.orientation.w = 1.0
-                
-                # If navigation hasn't started yet
-                if not hasattr(self, 'offload_started'):
-                    self.get_logger().info('Starting navigation to offload zone')
+                if not hasattr(self, 'nav_started'):
+                    # Set goal pose for the zone
+                    goal_pose = PoseStamped()
+                    goal_pose.header.frame_id = 'map'
+                    goal_pose.header.stamp = self.get_clock().now().to_msg()
+                    goal_pose.pose.position.x = 2.57
+                    goal_pose.pose.position.y = 2.5
+                    goal_pose.pose.orientation.w = 1.0
+                    
+                    self.get_logger().info('Starting navigation to zone')
                     self.navigator.goToPose(goal_pose)
-                    self.offload_started = True
+                    self.nav_started = True
                     return
-                
+
                 # Check if we've reached the goal
                 if self.navigator.isTaskComplete():
                     result = self.navigator.getResult()
@@ -385,21 +384,14 @@ class RobotController(Node):
                             response = future.result()
                             if response.success:
                                 self.get_logger().info('Successfully offloaded item!')
-                                self.offload_started = False
+                                self.nav_started = False
                                 self.state = State.FORWARD
-                            else:
-                                self.get_logger().info('Failed to offload item: ' + response.message)
                         except Exception as e:
                             self.get_logger().info(f'Service call failed: {str(e)}')
                     else:
                         self.get_logger().warn(f'Navigation failed with result: {result}')
-                        self.offload_started = False
+                        self.nav_started = False
                         self.state = State.FORWARD
-                else:
-                    # Still navigating, provide feedback
-                    feedback = self.navigator.getFeedback()
-                    if feedback and feedback.distance_remaining:
-                        self.get_logger().info(f'Distance remaining: {feedback.distance_remaining:.2f}m')
             case _:
                 pass
         
