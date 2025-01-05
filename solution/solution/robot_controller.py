@@ -49,21 +49,6 @@ SCAN_LEFT = 1
 SCAN_BACK = 2
 SCAN_RIGHT = 3
 
-# Zone positions (x, y coordinates)
-ZONES = {
-    'cyan': (2.57, 2.5),    # Top right
-    'purple': (-2.57, 2.5),  # Top left
-    'green': (-2.57, -2.5),  # Bottom left
-    'pink': (2.57, -2.5)    # Bottom right
-}
-
-# Color mapping for items to zones
-COLOR_TO_ZONE = {
-    'red': 'cyan',
-    'green': 'green',
-    'blue': 'purple'
-}
-
 # Finite state machine (FSM) states
 class State(Enum):
     FORWARD = 0
@@ -71,74 +56,109 @@ class State(Enum):
     COLLECTING = 2
     OFFLOADING = 3
 
+# Define zones and their positions
+ZONES = {
+    'Zone1': (-2.0, 2.0),
+    'Zone2': (2.0, 2.0),
+    'Zone3': (2.0, -2.0),
+    'Zone4': (-2.0, -2.0)
+}
+
+# Color to zone mapping
+COLOR_TO_ZONE = {
+    'red': 'Zone1',
+    'green': 'Zone2',
+    'blue': 'Zone3',
+    'yellow': 'Zone4'
+}
 
 class RobotController(Node):
 
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Class variables
-        self.state = State.FORWARD
-        self.pose = Pose()
-        self.previous_pose = Pose()
-        self.yaw = 0.0
-        self.previous_yaw = 0.0
-        self.turn_angle = 0.0
-        self.turn_direction = TURN_LEFT
-        self.goal_distance = random.uniform(1.0, 2.0)
-        self.scan_triggered = [False] * 4
+        # Class variables used to store persistent values between executions of callbacks and control loop
+        self.state = State.FORWARD # Current FSM state
+        self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
+        self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
+        self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
+        self.previous_yaw = 0.0 # Snapshot of the angle for comparison against future angles
+        self.turn_angle = 0.0 # Relative angle to turn to in the TURNING state
+        self.turn_direction = TURN_LEFT # Direction to turn in the TURNING state
+        self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
+        self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
         self.items = ItemList()
-        self.current_item_color = None
-        
-        # Parameters
+
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
-        
-        # Create callback groups
+
+        # Here we use two callback groups, to ensure that those in 'client_callback_group' can be executed
+        # independently from those in 'timer_callback_group'. This allos calling the services below within
+        # a callback handled by the timer_callback_group. See https://docs.ros.org/en/humble/How-To-Guides/Using-callback-groups.html
+        # for a detailed discussion on the ROS executors and callback groups.
         client_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
-        
-        # Publishers
-        self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10)
-        
-        # Subscribers
-        self.odom_subscriber = self.create_subscription(
-            Odometry,
-            '/odom',
-            self.odom_callback,
-            QoSPresetProfiles.SENSOR_DATA.value
-        )
-        
-        self.scan_subscriber = self.create_subscription(
-            LaserScan,
-            '/scan',
-            self.scan_callback,
-            QoSPresetProfiles.SENSOR_DATA.value
-        )
-        
+
+        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
+        self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
+
         self.item_subscriber = self.create_subscription(
             ItemList,
-            '/items',
+            'items',
             self.item_callback,
-            10
+            10, callback_group=timer_callback_group
         )
+
+        # Subscribes to Odometry messages published on /odom topic
+        # http://docs.ros.org/en/noetic/api/nav_msgs/html/msg/Odometry.html
+        #
+        # Final argument can either be an integer representing the history depth, or a Quality of Service (QoS) profile
+        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1335-L1338
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1187-L1196
+        #
+        # If you only specify a history depth, rclpy defaults to QoSHistoryPolicy.KEEP_LAST
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L80-L83
+        self.odom_subscriber = self.create_subscription(
+            Odometry,
+            'odom',
+            self.odom_callback,
+            10, callback_group=timer_callback_group)
         
-        # Services
-        self.pick_up_service = self.create_client(
-            ItemRequest,
-            '/pick_up_item',
-            callback_group=client_callback_group
-        )
-        
-        self.offload_service = self.create_client(
-            ItemRequest,
-            '/offload_item',
-            callback_group=client_callback_group
-        )
-        
-        # Timer
-        self.timer = self.create_timer(0.1, self.control_loop, callback_group=timer_callback_group)
+        # Subscribes to LaserScan messages on the /scan topic
+        # http://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/LaserScan.html
+        #
+        # QoSPresetProfiles.SENSOR_DATA specifices "best effort" reliability and a small queue size
+        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L455
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L428-L431
+        self.scan_subscriber = self.create_subscription(
+            LaserScan,
+            'scan',
+            self.scan_callback,
+            QoSPresetProfiles.SENSOR_DATA.value, callback_group=timer_callback_group)
+
+        # Publishes Twist messages (linear and angular velocities) on the /cmd_vel topic
+        # http://docs.ros.org/en/noetic/api/geometry_msgs/html/msg/Twist.html
+        # 
+        # Gazebo ROS differential drive plugin subscribes to these messages, and converts them into left and right wheel speeds
+        # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L537-L555
+        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+
+        #self.orientation_publisher = self.create_publisher(Float32, '/orientation', 10)
+
+        # Publishes custom StringWithPose (see auro_interfaces/msg/StringWithPose.msg) messages on the /marker_input topic
+        # The week3/rviz_text_marker node subscribes to these messages, and ouputs a Marker message on the /marker_output topic
+        # ros2 run week_3 rviz_text_marker
+        # This can be visualised in RViz: Add > By topic > /marker_output
+        #
+        # http://docs.ros.org/en/noetic/api/visualization_msgs/html/msg/Marker.html
+        # http://wiki.ros.org/rviz/DisplayTypes/Marker
+        self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10, callback_group=timer_callback_group)
+
+        # Creates a timer that calls the control_loop method repeatedly - each loop represents single iteration of the FSM
+        self.timer_period = 0.1 # 100 milliseconds = 10 Hz
+        self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
 
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
@@ -156,9 +176,19 @@ class RobotController(Node):
     #
     # The pose estimates are expressed in a coordinate system relative to the starting pose of the robot
     def odom_callback(self, msg):
-        self.pose = msg.pose.pose
-        orientation = msg.pose.pose.orientation
-        _, _, self.yaw = euler_from_quaternion([orientation.x, orientation.y, orientation.z, orientation.w])
+        self.pose = msg.pose.pose # Store the pose in a class variable
+
+        # Uses tf_transformations package to convert orientation from quaternion to Euler angles (RPY = roll, pitch, yaw)
+        # https://github.com/DLu/tf_transformations
+        #
+        # Roll (rotation around X axis) and pitch (rotation around Y axis) are discarded
+        (roll, pitch, yaw) = euler_from_quaternion([self.pose.orientation.x,
+                                                    self.pose.orientation.y,
+                                                    self.pose.orientation.z,
+                                                    self.pose.orientation.w])
+        
+        
+        self.yaw = yaw # Store the yaw in a class variable
 
     # Called every time scan_subscriber recieves a LaserScan message from the /scan topic
     #
@@ -171,16 +201,20 @@ class RobotController(Node):
     # http://wiki.ros.org/hls_lfcd_lds_driver
     # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/blob/humble-devel/turtlebot3_gazebo/models/turtlebot3_waffle_pi/model.sdf#L132-L165
     def scan_callback(self, msg):
-        # Process LiDAR data into 4 sectors (front, left, back, right)
-        sector_size = len(msg.ranges) // 4
-        for i in range(4):
-            start_idx = i * sector_size
-            end_idx = (i + 1) * sector_size
-            sector_ranges = msg.ranges[start_idx:end_idx]
-            # Filter out invalid readings
-            valid_ranges = [r for r in sector_ranges if msg.range_min <= r <= msg.range_max]
-            if valid_ranges:
-                self.scan_triggered[i] = min(valid_ranges) < SCAN_THRESHOLD
+        # Group scan ranges into 4 segments
+        # Front, left, and right segments are each 60 degrees
+        # Back segment is 180 degrees
+        front_ranges = msg.ranges[331:359] + msg.ranges[0:30] # 30 to 331 degrees (30 to -30 degrees)
+        left_ranges  = msg.ranges[31:90] # 31 to 90 degrees (31 to 90 degrees)
+        back_ranges  = msg.ranges[91:270] # 91 to 270 degrees (91 to -90 degrees)
+        right_ranges = msg.ranges[271:330] # 271 to 330 degrees (-30 to -91 degrees)
+
+        # Store True/False values for each sensor segment, based on whether the nearest detected obstacle is closer than SCAN_THRESHOLD
+        self.scan_triggered[SCAN_FRONT] = min(front_ranges) < SCAN_THRESHOLD 
+        self.scan_triggered[SCAN_LEFT]  = min(left_ranges)  < SCAN_THRESHOLD
+        self.scan_triggered[SCAN_BACK]  = min(back_ranges)  < SCAN_THRESHOLD
+        self.scan_triggered[SCAN_RIGHT] = min(right_ranges) < SCAN_THRESHOLD
+
 
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
