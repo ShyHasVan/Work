@@ -66,6 +66,9 @@ class RobotController(Node):
         # Add initialization check
         self.get_logger().info('Initializing robot controller...')
         
+        # Add executor as class variable
+        self.executor = MultiThreadedExecutor()
+        
         # Class variables used to store persistent values between executions of callbacks and control loop
         self.state = State.FORWARD # Current FSM state
         self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
@@ -154,10 +157,10 @@ class RobotController(Node):
         self.item_color = None
         self.target_zone = None
         self.zones = {
-            'cyan': {'x': -3.5, 'y': 2.5},      # Bottom left
-            'purple': {'x': -3.5, 'y': -2.5},    # Bottom right
-            'deeppink': {'x': 2.5, 'y': 2.5},    # Top left
-            'seagreen': {'x': 2.5, 'y': -2.5}    # Top right
+            'cyan': {'x': -3.0, 'y': 3.0},      # Bottom left
+            'purple': {'x': 3.0, 'y': -3.0},    # Bottom right
+            'deeppink': {'x': 3.0, 'y': 3.0},   # Top right
+            'seagreen': {'x': -3.0, 'y': -3.0}  # Top left
         }
         
         # Subscribe to zone information
@@ -169,7 +172,9 @@ class RobotController(Node):
             callback_group=timer_callback_group
         )
 
-        self.get_logger().info('Robot controller initialized successfully')
+        self.get_logger().info(f'Robot controller initialized with ID: {self.robot_id}')
+        self.get_logger().info(f'Initial position: ({self.pose.position.x:.2f}, {self.pose.position.y:.2f})')
+        self.get_logger().info(f'Initial state: {self.state}')
 
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
@@ -348,7 +353,7 @@ class RobotController(Node):
                     rqt.robot_id = self.robot_id
                     try:
                         future = self.pick_up_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
+                        self.executor.spin_until_future_complete(future)
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Successfully picked up item!')
@@ -406,7 +411,7 @@ class RobotController(Node):
                 rqt.robot_id = self.robot_id
                 try:
                     future = self.offload_service.call_async(rqt)
-                    rclpy.spin_until_future_complete(self, future)
+                    self.executor.spin_until_future_complete(future)
                     response = future.result()
                     if response.success:
                         self.get_logger().info('Successfully offloaded item!')
@@ -430,11 +435,12 @@ class RobotController(Node):
         super().destroy_node()
 
     def zone_callback(self, msg):
-        # Update zone information if needed
+        self.get_logger().info('Received zone update')
         for zone in msg.data:
             if zone.colour in self.zones:
-                # Update zone status/availability if needed
-                pass
+                # Store the zone's current color assignment if it has one
+                self.zones[zone.colour]['assigned_color'] = zone.assigned_colour if zone.assigned_colour else None
+                self.get_logger().info(f'Zone {zone.colour} status - Assigned color: {zone.assigned_colour}')
 
     def get_nearest_zone(self):
         # Find closest compatible zone for current item
