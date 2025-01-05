@@ -77,88 +77,62 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Class variables used to store persistent values between executions of callbacks and control loop
-        self.state = State.FORWARD # Current FSM state
-        self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
-        self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
-        self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
-        self.previous_yaw = 0.0 # Snapshot of the angle for comparison against future angles
-        self.turn_angle = 0.0 # Relative angle to turn to in the TURNING state
-        self.turn_direction = TURN_LEFT # Direction to turn in the TURNING state
-        self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
-        self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
+        # Class variables
+        self.state = State.FORWARD
+        self.pose = Pose()
+        self.previous_pose = Pose()
+        self.yaw = 0.0
+        self.previous_yaw = 0.0
+        self.turn_angle = 0.0
+        self.turn_direction = TURN_LEFT
+        self.goal_distance = random.uniform(1.0, 2.0)
+        self.scan_triggered = [False] * 4
         self.items = ItemList()
-
-        self.declare_parameter('robot_id', 'robot1')
-        self.robot_id = self.get_parameter('robot_id').value
-
-        # Here we use two callback groups, to ensure that those in 'client_callback_group' can be executed
-        # independently from those in 'timer_callback_group'. This allos calling the services below within
-        # a callback handled by the timer_callback_group. See https://docs.ros.org/en/humble/How-To-Guides/Using-callback-groups.html
-        # for a detailed discussion on the ROS executors and callback groups.
+        self.current_item_color = None
+        
+        # Create callback groups
         client_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
-
-        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
-        self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
-
+        
+        # Publishers
+        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10)
+        
+        # Subscribers
+        self.odom_subscriber = self.create_subscription(
+            Odometry, 'odom', self.odom_callback, 
+            QoSPresetProfiles.SENSOR_DATA.value,
+            callback_group=timer_callback_group
+        )
+        
+        self.scan_subscriber = self.create_subscription(
+            LaserScan, 'scan', self.scan_callback,
+            QoSPresetProfiles.SENSOR_DATA.value,
+            callback_group=timer_callback_group
+        )
+        
         self.item_subscriber = self.create_subscription(
-            ItemList,
-            'items',
-            self.item_callback,
+            ItemList, 'items', self.item_callback, 
             10, callback_group=timer_callback_group
         )
-
-        # Subscribes to Odometry messages published on /odom topic
-        # http://docs.ros.org/en/noetic/api/nav_msgs/html/msg/Odometry.html
-        #
-        # Final argument can either be an integer representing the history depth, or a Quality of Service (QoS) profile
-        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1335-L1338
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1187-L1196
-        #
-        # If you only specify a history depth, rclpy defaults to QoSHistoryPolicy.KEEP_LAST
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L80-L83
-        self.odom_subscriber = self.create_subscription(
-            Odometry,
-            'odom',
-            self.odom_callback,
-            10, callback_group=timer_callback_group)
         
-        # Subscribes to LaserScan messages on the /scan topic
-        # http://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/LaserScan.html
-        #
-        # QoSPresetProfiles.SENSOR_DATA specifices "best effort" reliability and a small queue size
-        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L455
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L428-L431
-        self.scan_subscriber = self.create_subscription(
-            LaserScan,
-            'scan',
-            self.scan_callback,
-            QoSPresetProfiles.SENSOR_DATA.value, callback_group=timer_callback_group)
-
-        # Publishes Twist messages (linear and angular velocities) on the /cmd_vel topic
-        # http://docs.ros.org/en/noetic/api/geometry_msgs/html/msg/Twist.html
-        # 
-        # Gazebo ROS differential drive plugin subscribes to these messages, and converts them into left and right wheel speeds
-        # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L537-L555
-        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
-
-        #self.orientation_publisher = self.create_publisher(Float32, '/orientation', 10)
-
-        # Publishes custom StringWithPose (see auro_interfaces/msg/StringWithPose.msg) messages on the /marker_input topic
-        # The week3/rviz_text_marker node subscribes to these messages, and ouputs a Marker message on the /marker_output topic
-        # ros2 run week_3 rviz_text_marker
-        # This can be visualised in RViz: Add > By topic > /marker_output
-        #
-        # http://docs.ros.org/en/noetic/api/visualization_msgs/html/msg/Marker.html
-        # http://wiki.ros.org/rviz/DisplayTypes/Marker
-        self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10, callback_group=timer_callback_group)
-
-        # Creates a timer that calls the control_loop method repeatedly - each loop represents single iteration of the FSM
-        self.timer_period = 0.1 # 100 milliseconds = 10 Hz
-        self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
+        # Services
+        self.pick_up_service = self.create_client(
+            ItemRequest, '/pick_up_item',
+            callback_group=client_callback_group
+        )
+        
+        self.offload_service = self.create_client(
+            ItemRequest, '/offload_item',
+            callback_group=client_callback_group
+        )
+        
+        # Timer
+        self.timer = self.create_timer(0.1, self.control_loop, callback_group=timer_callback_group)
+        
+        # Parameters
+        self.declare_parameter('robot_id', 'robot1')
+        self.robot_id = self.get_parameter('robot_id').value
 
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
