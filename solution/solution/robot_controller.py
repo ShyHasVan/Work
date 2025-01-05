@@ -138,7 +138,11 @@ class RobotController(Node):
         )
         
         # Timer
-        self.timer = self.create_timer(0.1, self.control_loop, callback_group=timer_callback_group)
+        self.timer = self.create_timer(
+            0.1,  # seconds
+            self.control_loop,
+            callback_group=timer_callback_group
+        )
 
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
@@ -156,19 +160,9 @@ class RobotController(Node):
     #
     # The pose estimates are expressed in a coordinate system relative to the starting pose of the robot
     def odom_callback(self, msg):
-        self.pose = msg.pose.pose # Store the pose in a class variable
-
-        # Uses tf_transformations package to convert orientation from quaternion to Euler angles (RPY = roll, pitch, yaw)
-        # https://github.com/DLu/tf_transformations
-        #
-        # Roll (rotation around X axis) and pitch (rotation around Y axis) are discarded
-        (roll, pitch, yaw) = euler_from_quaternion([self.pose.orientation.x,
-                                                    self.pose.orientation.y,
-                                                    self.pose.orientation.z,
-                                                    self.pose.orientation.w])
-        
-        
-        self.yaw = yaw # Store the yaw in a class variable
+        self.pose = msg.pose.pose
+        orientation = msg.pose.pose.orientation
+        _, _, self.yaw = euler_from_quaternion([orientation.x, orientation.y, orientation.z, orientation.w])
 
     # Called every time scan_subscriber recieves a LaserScan message from the /scan topic
     #
@@ -181,20 +175,16 @@ class RobotController(Node):
     # http://wiki.ros.org/hls_lfcd_lds_driver
     # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/blob/humble-devel/turtlebot3_gazebo/models/turtlebot3_waffle_pi/model.sdf#L132-L165
     def scan_callback(self, msg):
-        # Group scan ranges into 4 segments
-        # Front, left, and right segments are each 60 degrees
-        # Back segment is 180 degrees
-        front_ranges = msg.ranges[331:359] + msg.ranges[0:30] # 30 to 331 degrees (30 to -30 degrees)
-        left_ranges  = msg.ranges[31:90] # 31 to 90 degrees (31 to 90 degrees)
-        back_ranges  = msg.ranges[91:270] # 91 to 270 degrees (91 to -90 degrees)
-        right_ranges = msg.ranges[271:330] # 271 to 330 degrees (-30 to -91 degrees)
-
-        # Store True/False values for each sensor segment, based on whether the nearest detected obstacle is closer than SCAN_THRESHOLD
-        self.scan_triggered[SCAN_FRONT] = min(front_ranges) < SCAN_THRESHOLD 
-        self.scan_triggered[SCAN_LEFT]  = min(left_ranges)  < SCAN_THRESHOLD
-        self.scan_triggered[SCAN_BACK]  = min(back_ranges)  < SCAN_THRESHOLD
-        self.scan_triggered[SCAN_RIGHT] = min(right_ranges) < SCAN_THRESHOLD
-
+        # Process LiDAR data into 4 sectors (front, left, back, right)
+        sector_size = len(msg.ranges) // 4
+        for i in range(4):
+            start_idx = i * sector_size
+            end_idx = (i + 1) * sector_size
+            sector_ranges = msg.ranges[start_idx:end_idx]
+            # Filter out invalid readings
+            valid_ranges = [r for r in sector_ranges if msg.range_min <= r <= msg.range_max]
+            if valid_ranges:
+                self.scan_triggered[i] = min(valid_ranges) < SCAN_THRESHOLD
 
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
@@ -317,6 +307,7 @@ class RobotController(Node):
                         if response.success:
                             self.get_logger().info('Successfully picked up item!')
                             self.current_item_color = closest_item.colour
+                            self.items.data = []  # Clear items list after pickup
                             self.state = State.OFFLOADING
                             return
                         else:
