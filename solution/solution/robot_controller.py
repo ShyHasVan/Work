@@ -68,6 +68,7 @@ class RobotController(Node):
         super().__init__('robot_controller')
         
         # Class variables first
+        self.state = State.FORWARD  # Initialize state
         self.pose = Pose()
         self.previous_pose = Pose()
         self.yaw = 0.0
@@ -78,7 +79,7 @@ class RobotController(Node):
         self.scan_triggered = [False] * 4
         self.items = ItemList()
         
-        # Initialize Nav2 immediately
+        # Initialize Nav2
         self.navigator = BasicNavigator()
         
         # Set initial pose
@@ -89,7 +90,6 @@ class RobotController(Node):
         initial_pose.pose.position.y = 0.0
         initial_pose.pose.orientation.w = 1.0
         
-        # Set initial pose and wait for Nav2
         self.navigator.setInitialPose(initial_pose)
         self.navigator.waitUntilNav2Active()
         
