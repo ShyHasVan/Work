@@ -32,26 +32,26 @@ from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
 
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
+from tf2_ros import TransformException
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
 import angles
 
 from enum import Enum
-from tf2_ros import Buffer, TransformListener, TransformException
 
-LINEAR_VELOCITY  = 0.3 # Metres per second
-ANGULAR_VELOCITY = 0.5 # Radians per second
-
-TURN_LEFT = 1 # Postive angular velocity turns left
-TURN_RIGHT = -1 # Negative angular velocity turns right
-
-SCAN_THRESHOLD = 0.5 # Metres per second
- # Array indexes for sensor sectors
+# Constants
+LINEAR_VELOCITY = 0.3  # Metres per second
+ANGULAR_VELOCITY = 0.5  # Radians per second
+TURN_LEFT = 1  # Positive angular velocity turns left
+TURN_RIGHT = -1  # Negative angular velocity turns right
+SCAN_THRESHOLD = 0.5  # Metres
 SCAN_FRONT = 0
 SCAN_LEFT = 1
 SCAN_BACK = 2
 SCAN_RIGHT = 3
 
-# Finite state machine (FSM) states
+# FSM States
 class State(Enum):
     FORWARD = 0
     TURNING = 1
