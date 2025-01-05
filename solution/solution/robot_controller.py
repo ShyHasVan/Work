@@ -25,7 +25,7 @@ from std_msgs.msg import Float32
 from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from assessment_interfaces.msg import Item, ItemList
+from assessment_interfaces.msg import Item, ItemList, Zone, ZoneList
 from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
 
@@ -62,6 +62,9 @@ class RobotController(Node):
 
     def __init__(self):
         super().__init__('robot_controller')
+        
+        # Add initialization check
+        self.get_logger().info('Initializing robot controller...')
         
         # Class variables used to store persistent values between executions of callbacks and control loop
         self.state = State.FORWARD # Current FSM state
@@ -166,6 +169,8 @@ class RobotController(Node):
             callback_group=timer_callback_group
         )
 
+        self.get_logger().info('Robot controller initialized successfully')
+
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
             # Only log when we first see an item
@@ -224,6 +229,10 @@ class RobotController(Node):
 
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
+        # Add more detailed state logging
+        self.get_logger().info(f'Current state: {self.state}, Position: ({self.pose.position.x:.2f}, {self.pose.position.y:.2f}), ' +
+                              f'Yaw: {math.degrees(self.yaw):.2f}°, Items visible: {len(self.items.data)}')
+        
         # Add debug info about items near the start of control_loop
         if len(self.items.data) > 0:
             item = self.items.data[0]
@@ -313,6 +322,7 @@ class RobotController(Node):
 
             case State.COLLECTING:
                 if len(self.items.data) == 0:
+                    self.get_logger().info('Lost sight of item, returning to FORWARD state')
                     self.previous_pose = self.pose
                     self.goal_distance = random.uniform(1.0, 2.0)
                     self.state = State.FORWARD
@@ -322,14 +332,14 @@ class RobotController(Node):
                 closest_item = max(self.items.data, key=lambda x: x.diameter)
                 msg = Twist()
 
-                # x is left/right in camera view (negative is right)
-                # y is up/down in camera view (negative is down)
                 angle_to_item = closest_item.x / 320.0  # Convert pixel x to normalized angle
                 estimated_distance = 32.4 * float(closest_item.diameter) ** -0.75
                 
-                self.get_logger().info(f'Item detected - Distance: {estimated_distance:.2f}m, Angle: {math.degrees(angle_to_item):.2f}°')
+                self.get_logger().info(f'Approaching item - Distance: {estimated_distance:.2f}m, ' +
+                                      f'Angle: {math.degrees(angle_to_item):.2f}°, ' +
+                                      f'Color: {closest_item.colour}')
 
-                if estimated_distance < 0.35:  # DISTANCE from item_manager.py
+                if estimated_distance < 0.35:
                     msg.linear.x = 0.0
                     msg.angular.z = 0.0
                     self.cmd_vel_publisher.publish(msg)
@@ -352,9 +362,9 @@ class RobotController(Node):
                     except Exception as e:
                         self.get_logger().info(f'Service call failed: {str(e)}')
                 else:
-                    # Use proportional control for smoother approach
-                    msg.linear.x = 0.25 * estimated_distance  # Proportional to distance
-                    msg.angular.z = angle_to_item  # Proportional to angle offset
+                    # Adjust approach speeds for smoother motion
+                    msg.linear.x = max(0.1, min(0.3, 0.25 * estimated_distance))  # Limit speed range
+                    msg.angular.z = max(-0.5, min(0.5, angle_to_item))  # Limit turning rate
                     self.cmd_vel_publisher.publish(msg)
 
             case State.NAVIGATING_TO_ZONE:
@@ -435,9 +445,18 @@ class RobotController(Node):
             dx = pos['x'] - self.pose.position.x
             dy = pos['y'] - self.pose.position.y
             dist = math.sqrt(dx*dx + dy*dy)
+            
+            # Log zone distances for debugging
+            self.get_logger().info(f'Zone {color}: distance = {dist:.2f}m')
+            
             if dist < min_dist:
                 min_dist = dist
                 nearest = color
+        
+        if nearest:
+            self.get_logger().info(f'Selected zone {nearest} at distance {min_dist:.2f}m')
+        else:
+            self.get_logger().info('No suitable zone found')
         
         return nearest
 
