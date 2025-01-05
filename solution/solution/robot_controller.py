@@ -80,7 +80,13 @@ class RobotController(Node):
         # Class variables
         self.state = State.FORWARD
         self.pose = Pose()
+        self.previous_pose = Pose()
         self.yaw = 0.0
+        self.previous_yaw = 0.0
+        self.turn_angle = 0.0
+        self.turn_direction = TURN_LEFT
+        self.goal_distance = random.uniform(1.0, 2.0)
+        self.scan_triggered = [False] * 4
         self.items = ItemList()
         self.current_item_color = None
         
@@ -88,15 +94,27 @@ class RobotController(Node):
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
         
+        # Create callback groups
+        client_callback_group = MutuallyExclusiveCallbackGroup()
+        timer_callback_group = MutuallyExclusiveCallbackGroup()
+        
         # Publishers
         self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10)
         
         # Subscribers
         self.odom_subscriber = self.create_subscription(
             Odometry,
             '/odom',
             self.odom_callback,
-            10
+            QoSPresetProfiles.SENSOR_DATA.value
+        )
+        
+        self.scan_subscriber = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.scan_callback,
+            QoSPresetProfiles.SENSOR_DATA.value
         )
         
         self.item_subscriber = self.create_subscription(
@@ -107,11 +125,20 @@ class RobotController(Node):
         )
         
         # Services
-        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item')
-        self.offload_service = self.create_client(ItemRequest, '/offload_item')
+        self.pick_up_service = self.create_client(
+            ItemRequest,
+            '/pick_up_item',
+            callback_group=client_callback_group
+        )
+        
+        self.offload_service = self.create_client(
+            ItemRequest,
+            '/offload_item',
+            callback_group=client_callback_group
+        )
         
         # Timer
-        self.timer = self.create_timer(0.1, self.control_loop)
+        self.timer = self.create_timer(0.1, self.control_loop, callback_group=timer_callback_group)
 
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
