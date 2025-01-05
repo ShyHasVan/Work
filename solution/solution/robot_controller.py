@@ -90,6 +90,10 @@ class RobotController(Node):
         self.items = ItemList()
         self.current_item_color = None
         
+        # Parameters
+        self.declare_parameter('robot_id', 'robot1')
+        self.robot_id = self.get_parameter('robot_id').value
+
         # Create callback groups
         client_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
@@ -103,24 +107,21 @@ class RobotController(Node):
             Odometry,
             '/odom',
             self.odom_callback,
-            QoSPresetProfiles.SENSOR_DATA.value,
-            callback_group=timer_callback_group
+            QoSPresetProfiles.SENSOR_DATA.value
         )
         
         self.scan_subscriber = self.create_subscription(
             LaserScan,
             '/scan',
             self.scan_callback,
-            QoSPresetProfiles.SENSOR_DATA.value,
-            callback_group=timer_callback_group
+            QoSPresetProfiles.SENSOR_DATA.value
         )
         
         self.item_subscriber = self.create_subscription(
             ItemList,
             '/items',
             self.item_callback,
-            10,
-            callback_group=timer_callback_group
+            10
         )
         
         # Services
@@ -138,10 +139,6 @@ class RobotController(Node):
         
         # Timer
         self.timer = self.create_timer(0.1, self.control_loop, callback_group=timer_callback_group)
-        
-        # Parameters
-        self.declare_parameter('robot_id', 'robot1')
-        self.robot_id = self.get_parameter('robot_id').value
 
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
