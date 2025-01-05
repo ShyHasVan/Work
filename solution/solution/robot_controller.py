@@ -22,45 +22,37 @@ from rclpy.signals import SignalHandlerOptions
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.qos import QoSPresetProfiles
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.duration import Duration
 
-from geometry_msgs.msg import Twist, Pose, PoseStamped
+from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from assessment_interfaces.msg import Item, ItemList
 from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
 
-from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
-from tf2_ros import TransformException
-from tf2_ros.buffer import Buffer
-from tf2_ros.transform_listener import TransformListener
-from tf_transformations import euler_from_quaternion, quaternion_from_euler
+from tf_transformations import euler_from_quaternion
 import angles
 
 from enum import Enum
 
 # Constants
-LINEAR_VELOCITY = 0.3  # Metres per second
-ANGULAR_VELOCITY = 0.5  # Radians per second
-TURN_LEFT = 1  # Positive angular velocity turns left
-TURN_RIGHT = -1  # Negative angular velocity turns right
-SCAN_THRESHOLD = 0.5  # Metres
+LINEAR_VELOCITY = 0.3
+ANGULAR_VELOCITY = 0.5
+TURN_LEFT = 1
+TURN_RIGHT = -1
+SCAN_THRESHOLD = 0.5
 SCAN_FRONT = 0
 SCAN_LEFT = 1
 SCAN_BACK = 2
 SCAN_RIGHT = 3
 
-# FSM States
 class State(Enum):
     FORWARD = 0
     TURNING = 1
     COLLECTING = 2
     OFFLOADING = 3
 
-
 class RobotController(Node):
-
     def __init__(self):
         super().__init__('robot_controller')
         
@@ -76,169 +68,73 @@ class RobotController(Node):
         self.scan_triggered = [False] * 4
         self.items = ItemList()
         
-        # Initialize Nav2 later when needed
-        self.navigator = None
-        
         # Create callback groups
         client_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
         
-        # Initialize publishers
+        # Publishers
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
-        self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10)
         
-        # Initialize subscribers
+        # Subscribers
         self.odom_subscriber = self.create_subscription(
-            Odometry,
-            'odom',
-            self.odom_callback,
-            QoSPresetProfiles.SENSOR_DATA.value,
-            callback_group=timer_callback_group
+            Odometry, 'odom', self.odom_callback, 
+            QoSPresetProfiles.SENSOR_DATA.value
         )
         
         self.scan_subscriber = self.create_subscription(
-            LaserScan,
-            'scan',
-            self.scan_callback,
-            QoSPresetProfiles.SENSOR_DATA.value,
-            callback_group=timer_callback_group
+            LaserScan, 'scan', self.scan_callback,
+            QoSPresetProfiles.SENSOR_DATA.value
         )
         
         self.items_subscriber = self.create_subscription(
-            ItemList,
-            'items',
-            self.items_callback,
-            10,
-            callback_group=timer_callback_group
+            ItemList, 'items', self.item_callback, 10
         )
         
-        # Initialize services
+        # Services
         self.pick_up_service = self.create_client(
-            ItemRequest,
-            'pick_up_item',
+            ItemRequest, '/pick_up_item', 
             callback_group=client_callback_group
         )
         
         self.offload_service = self.create_client(
-            ItemRequest,
-            'offload_item',
+            ItemRequest, '/offload_item',
             callback_group=client_callback_group
         )
         
-        # Initialize timer
-        self.timer_period = 0.1
-        self.timer = self.create_timer(
-            self.timer_period,
-            self.control_loop,
-            callback_group=timer_callback_group
-        )
+        # Timer
+        self.timer = self.create_timer(0.1, self.control_loop)
         
         # Parameters
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
 
     def item_callback(self, msg):
-        if len(msg.data) > 0 and len(self.items.data) == 0:
-            # Only log when we first see an item
-            self.get_logger().info(f'New item detected! Count: {len(msg.data)}')
         self.items = msg
 
-    # Called every time odom_subscriber receives an Odometry message from the /odom topic
-    #
-    # The Gazebo ROS differential drive plugin generates these messages using kinematic equations, and publishes them
-    # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L434-L535
-    #
-    # This plugin is configured with physical measurements of the TurtleBot3 in the SDF file that defines the robot model
-    # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/blob/humble-devel/turtlebot3_gazebo/models/turtlebot3_waffle_pi/model.sdf#L476-L507
-    #
-    # The pose estimates are expressed in a coordinate system relative to the starting pose of the robot
     def odom_callback(self, msg):
-        self.pose = msg.pose.pose # Store the pose in a class variable
+        self.pose = msg.pose.pose
+        (roll, pitch, yaw) = euler_from_quaternion([
+            self.pose.orientation.x,
+            self.pose.orientation.y,
+            self.pose.orientation.z,
+            self.pose.orientation.w
+        ])
+        self.yaw = yaw
 
-        # Uses tf_transformations package to convert orientation from quaternion to Euler angles (RPY = roll, pitch, yaw)
-        # https://github.com/DLu/tf_transformations
-        #
-        # Roll (rotation around X axis) and pitch (rotation around Y axis) are discarded
-        (roll, pitch, yaw) = euler_from_quaternion([self.pose.orientation.x,
-                                                    self.pose.orientation.y,
-                                                    self.pose.orientation.z,
-                                                    self.pose.orientation.w])
-        
-        
-        self.yaw = yaw # Store the yaw in a class variable
-
-    # Called every time scan_subscriber recieves a LaserScan message from the /scan topic
-    #
-    # The Gazebo RaySensor calculates distance at which rays intersect with obstacles
-    # The data is published by the Gazebo ROS ray sensor plugin
-    # https://github.com/gazebosim/gazebo-classic/tree/gazebo11/gazebo/sensors
-    # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_ray_sensor.cpp#L178-L205
-    #
-    # This plugin is configured to match the LiDAR on the TurtleBot3 in the SDF file that defines the robot model
-    # http://wiki.ros.org/hls_lfcd_lds_driver
-    # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/blob/humble-devel/turtlebot3_gazebo/models/turtlebot3_waffle_pi/model.sdf#L132-L165
     def scan_callback(self, msg):
-        # Group scan ranges into 4 segments
-        # Front, left, and right segments are each 60 degrees
-        # Back segment is 180 degrees
-        front_ranges = msg.ranges[331:359] + msg.ranges[0:30] # 30 to 331 degrees (30 to -30 degrees)
-        left_ranges  = msg.ranges[31:90] # 31 to 90 degrees (31 to 90 degrees)
-        back_ranges  = msg.ranges[91:270] # 91 to 270 degrees (91 to -90 degrees)
-        right_ranges = msg.ranges[271:330] # 271 to 330 degrees (-30 to -91 degrees)
-
-        # Store True/False values for each sensor segment, based on whether the nearest detected obstacle is closer than SCAN_THRESHOLD
-        self.scan_triggered[SCAN_FRONT] = min(front_ranges) < SCAN_THRESHOLD 
-        self.scan_triggered[SCAN_LEFT]  = min(left_ranges)  < SCAN_THRESHOLD
-        self.scan_triggered[SCAN_BACK]  = min(back_ranges)  < SCAN_THRESHOLD
+        front_ranges = msg.ranges[331:359] + msg.ranges[0:30]
+        left_ranges = msg.ranges[31:90]
+        back_ranges = msg.ranges[91:270]
+        right_ranges = msg.ranges[271:330]
+        
+        self.scan_triggered[SCAN_FRONT] = min(front_ranges) < SCAN_THRESHOLD
+        self.scan_triggered[SCAN_LEFT] = min(left_ranges) < SCAN_THRESHOLD
+        self.scan_triggered[SCAN_BACK] = min(back_ranges) < SCAN_THRESHOLD
         self.scan_triggered[SCAN_RIGHT] = min(right_ranges) < SCAN_THRESHOLD
 
-
-    # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
-        # Add debug info about items near the start of control_loop
-        if len(self.items.data) > 0:
-            item = self.items.data[0]
-            self.get_logger().info(f'Current state: {self.state}, Items in view: {len(self.items.data)}, '
-                                 f'Nearest item at: ({item.x:.2f}, {item.y:.2f})')
-        elif self.state == State.COLLECTING:
-            self.get_logger().info('In COLLECTING state but no items visible!')
-
-        # Send message to rviz_text_marker node
-        marker_input = StringWithPose()
-        marker_input.text = str(self.state) # Visualise robot state as an RViz marker
-        marker_input.pose = self.pose # Set the pose of the RViz marker to track the robot's pose
-        self.marker_publisher.publish(marker_input)
-
-        #self.get_logger().info(f"{self.state}")
-        
         match self.state:
-
             case State.FORWARD:
-
-                if self.scan_triggered[SCAN_FRONT]:
-                    self.previous_yaw = self.yaw
-                    self.state = State.TURNING
-                    self.turn_angle = random.uniform(150, 170)
-                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                    self.get_logger().info("Detected obstacle in front, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
-                    return
-                
-                if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
-                    self.previous_yaw = self.yaw
-                    self.state = State.TURNING
-                    self.turn_angle = 45
-
-                    if self.scan_triggered[SCAN_LEFT] and self.scan_triggered[SCAN_RIGHT]:
-                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                        self.get_logger().info("Detected obstacle to both the left and right, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
-                    elif self.scan_triggered[SCAN_LEFT]:
-                        self.turn_direction = TURN_RIGHT
-                        self.get_logger().info(f"Detected obstacle to the left, turning right by {self.turn_angle} degrees")
-                    else: # self.scan_triggered[SCAN_RIGHT]
-                        self.turn_direction = TURN_LEFT
-                        self.get_logger().info(f"Detected obstacle to the right, turning left by {self.turn_angle} degrees")
-                    return
-                
                 if len(self.items.data) > 0:
                     self.state = State.COLLECTING
                     return
@@ -251,8 +147,6 @@ class RobotController(Node):
                 difference_y = self.pose.position.y - self.previous_pose.position.y
                 distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
 
-                # self.get_logger().info(f"Driven {distance_travelled:.2f} out of {self.goal_distance:.2f} metres")
-
                 if distance_travelled >= self.goal_distance:
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
@@ -261,9 +155,6 @@ class RobotController(Node):
                     self.get_logger().info("Goal reached, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
 
             case State.TURNING:
-
-                self.get_logger().info("Turning state")
-
                 if len(self.items.data) > 0:
                     self.state = State.COLLECTING
                     return
@@ -271,8 +162,6 @@ class RobotController(Node):
                 msg = Twist()
                 msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
-
-                # self.get_logger().info(f"Turned {math.degrees(math.fabs(yaw_difference)):.2f} out of {self.turn_angle:.2f} degrees")
 
                 yaw_difference = angles.normalize_angle(self.yaw - self.previous_yaw)                
 
@@ -285,26 +174,13 @@ class RobotController(Node):
             case State.COLLECTING:
                 if len(self.items.data) == 0:
                     self.previous_pose = self.pose
-                    self.goal_distance = random.uniform(1.0, 2.0)
                     self.state = State.FORWARD
                     return
                 
-                # Choose the closest item based on diameter (larger diameter = closer)
-                closest_item = max(self.items.data, key=lambda x: x.diameter)
-                msg = Twist()
+                item = self.items.data[0]
+                estimated_distance = 32.4 * float(item.diameter) ** -0.75
 
-                # x is left/right in camera view (negative is right)
-                # y is up/down in camera view (negative is down)
-                angle_to_item = closest_item.x / 320.0  # Convert pixel x to normalized angle
-                estimated_distance = 32.4 * float(closest_item.diameter) ** -0.75
-                
-                self.get_logger().info(f'Item detected - Distance: {estimated_distance:.2f}m, Angle: {math.degrees(angle_to_item):.2f}°')
-
-                if estimated_distance < 0.35:  # DISTANCE from item_manager.py
-                    msg.linear.x = 0.0
-                    msg.angular.z = 0.0
-                    self.cmd_vel_publisher.publish(msg)
-                    
+                if estimated_distance <= 0.35:
                     rqt = ItemRequest.Request()
                     rqt.robot_id = self.robot_id
                     try:
@@ -312,137 +188,44 @@ class RobotController(Node):
                         rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
-                            self.get_logger().info('Successfully picked up item!')
+                            self.get_logger().info('Item picked up!')
                             self.state = State.OFFLOADING
+                            self.items.data = []
                         else:
-                            self.get_logger().info('Failed to pick up item: ' + response.message)
-                            # Move slightly closer if pickup failed
-                            msg.linear.x = 0.05
-                            self.cmd_vel_publisher.publish(msg)
+                            self.get_logger().info('Unable to pick up item: ' + response.message)
                     except Exception as e:
                         self.get_logger().info(f'Service call failed: {str(e)}')
-                else:
-                    # Use proportional control for smoother approach
-                    msg.linear.x = 0.25 * estimated_distance  # Proportional to distance
-                    msg.angular.z = angle_to_item  # Proportional to angle offset
-                    self.cmd_vel_publisher.publish(msg)
-            case State.OFFLOADING:
-                # Initialize Nav2 if needed
-                if self.navigator is None:
-                    if self.init_navigation():
-                        self.get_logger().info('Nav2 initialized')
-                    return
-                
-                # Set goal pose for the zone
-                goal_pose = PoseStamped()
-                goal_pose.header.frame_id = 'map'
-                goal_pose.header.stamp = self.get_clock().now().to_msg()
-                goal_pose.pose.position.x = 2.57
-                goal_pose.pose.position.y = 2.5
-                goal_pose.pose.orientation.w = 1.0
-                
-                # Start navigation if not already started
-                if not hasattr(self, 'nav_started'):
-                    self.get_logger().info('Starting navigation to zone')
-                    # Stop any current movement
-                    stop_msg = Twist()
-                    self.cmd_vel_publisher.publish(stop_msg)
-                    # Start navigation
-                    self.navigator.goToPose(goal_pose)
-                    self.nav_started = True
-                    return
-                
-                # Check navigation progress
-                if not self.navigator.isTaskComplete():
-                    # Optional: Add timeout like in week_8
-                    return
-                    
-                # Navigation completed
-                result = self.navigator.getResult()
-                if result == TaskResult.SUCCEEDED:
-                    # Try to offload
-                    rqt = ItemRequest.Request()
-                    rqt.robot_id = self.robot_id
-                    try:
-                        future = self.offload_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
-                        response = future.result()
-                        if response.success:
-                            self.get_logger().info('Successfully offloaded item!')
-                            self.nav_started = False
-                            self.state = State.FORWARD
-                    except Exception as e:
-                        self.get_logger().info(f'Service call failed: {str(e)}')
-                else:
-                    self.get_logger().warn(f'Navigation failed with result: {result}')
-                    self.nav_started = False
-                    self.state = State.FORWARD
-            case _:
-                pass
-        
-    def destroy_node(self):
-        msg = Twist()
-        self.cmd_vel_publisher.publish(msg)
-        self.get_logger().info(f"Stopping: {msg}")
-        super().destroy_node()
 
-    def init_navigation(self):
-        if self.navigator is None:
-            self.navigator = BasicNavigator()
-            
-            # Create transform buffer and listener
-            self.tf_buffer = Buffer()
-            self.tf_listener = TransformListener(self.tf_buffer, self)
-            
-            # Wait for transform to be available
-            try:
-                self.get_logger().info('Waiting for transform...')
-                # Wait for transform between map and base_link
-                while not self.tf_buffer.can_transform('map', 'base_link', rclpy.time.Time()):
-                    self.get_logger().info('Waiting for transform between map and base_link...')
-                    rclpy.sleep(1.0)
-                
-                # Get the current transform
-                transform = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
-                
-                # Set initial pose using the transform
-                initial_pose = PoseStamped()
-                initial_pose.header.frame_id = 'map'
-                initial_pose.header.stamp = self.get_clock().now().to_msg()
-                initial_pose.pose.position.x = transform.transform.translation.x
-                initial_pose.pose.position.y = transform.transform.translation.y
-                initial_pose.pose.orientation = transform.transform.rotation
-                
-                self.navigator.setInitialPose(initial_pose)
-                self.navigator.waitUntilNav2Active()
-                self.get_logger().info('Nav2 initialized successfully')
-                return True
-                
-            except TransformException as ex:
-                self.get_logger().error(f'Could not transform: {str(ex)}')
-                return False
-                
-        return False
+                msg = Twist()
+                msg.linear.x = 0.25 * estimated_distance
+                msg.angular.z = item.x / 320.0
+                self.cmd_vel_publisher.publish(msg)
+
+            case State.OFFLOADING:
+                # Try to offload in the zone
+                rqt = ItemRequest.Request()
+                rqt.robot_id = self.robot_id
+                try:
+                    future = self.offload_service.call_async(rqt)
+                    rclpy.spin_until_future_complete(self, future)
+                    response = future.result()
+                    if response.success:
+                        self.get_logger().info('Successfully offloaded item!')
+                        self.state = State.FORWARD
+                except Exception as e:
+                    self.get_logger().info(f'Service call failed: {str(e)}')
+                    self.state = State.FORWARD
 
 def main(args=None):
-
-    rclpy.init(args = args, signal_handler_options = SignalHandlerOptions.NO)
-
+    rclpy.init(args=args)
     node = RobotController()
-
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
-
     try:
-        executor.spin()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    except ExternalShutdownException:
-        sys.exit(1)
     finally:
         node.destroy_node()
-        rclpy.try_shutdown()
-
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
