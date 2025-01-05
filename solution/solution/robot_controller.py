@@ -67,6 +67,9 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
+        # Initialize Nav2 first
+        self.navigator = BasicNavigator()
+        
         # Class variables
         self.pose = Pose()
         self.previous_pose = Pose()
@@ -78,9 +81,6 @@ class RobotController(Node):
         self.scan_triggered = [False] * 4
         self.items = ItemList()
         
-        # Initialize Nav2
-        self.navigator = BasicNavigator()
-        
         # Set initial pose
         initial_pose = PoseStamped()
         initial_pose.header.frame_id = 'map'
@@ -89,8 +89,11 @@ class RobotController(Node):
         initial_pose.pose.position.y = 0.0
         initial_pose.pose.orientation.w = 1.0
         
+        # Set initial pose and wait for Nav2
         self.navigator.setInitialPose(initial_pose)
+        self.get_logger().info('Waiting for Nav2...')
         self.navigator.waitUntilNav2Active()
+        self.get_logger().info('Nav2 activated successfully!')
         
         # Rest of initialization (services, subscribers, etc.)
         self.declare_parameter('robot_id', 'robot1')
@@ -354,52 +357,51 @@ class RobotController(Node):
                     msg.angular.z = angle_to_item  # Proportional to angle offset
                     self.cmd_vel_publisher.publish(msg)
             case State.OFFLOADING:
-                if not hasattr(self, 'navigation_started') or not self.navigation_started:
-                    # Set goal pose for the zone
-                    goal_pose = PoseStamped()
-                    goal_pose.header.frame_id = 'map'
-                    goal_pose.header.stamp = self.get_clock().now().to_msg()
-                    
-                    # TOP_LEFT zone coordinates
-                    goal_pose.pose.position.x = 2.57
-                    goal_pose.pose.position.y = 2.5
-                    goal_pose.pose.orientation.w = 1.0
-                    
-                    self.get_logger().info(f'Starting navigation to zone')
-                    self.navigator.goToPose(goal_pose)
-                    self.navigation_started = True
-                    return
-
-                # Check if we're still navigating
-                if not self.navigator.isTaskComplete():
-                    feedback = self.navigator.getFeedback()
-                    if feedback:
-                        self.get_logger().info(f'Distance remaining: {feedback.distance_remaining:.2f}m')
-                    return
-                    
-                # Navigation is complete, check result
-                result = self.navigator.getResult()
+                # Set goal pose for the zone
+                goal_pose = PoseStamped()
+                goal_pose.header.frame_id = 'map'
+                goal_pose.header.stamp = self.get_clock().now().to_msg()
                 
-                if result == TaskResult.SUCCEEDED:
-                    # Try to offload
-                    rqt = ItemRequest.Request()
-                    rqt.robot_id = self.robot_id
-                    try:
-                        future = self.offload_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
-                        response = future.result()
-                        if response.success:
-                            self.get_logger().info('Successfully offloaded item!')
-                            self.navigation_started = False
-                            self.state = State.FORWARD
-                        else:
-                            self.get_logger().info('Failed to offload item: ' + response.message)
-                    except Exception as e:
-                        self.get_logger().info(f'Service call failed: {str(e)}')
+                # TOP_LEFT zone coordinates
+                goal_pose.pose.position.x = 2.57
+                goal_pose.pose.position.y = 2.5
+                goal_pose.pose.orientation.w = 1.0
+                
+                # If navigation hasn't started yet
+                if not hasattr(self, 'offload_started'):
+                    self.get_logger().info('Starting navigation to offload zone')
+                    self.navigator.goToPose(goal_pose)
+                    self.offload_started = True
+                    return
+                
+                # Check if we've reached the goal
+                if self.navigator.isTaskComplete():
+                    result = self.navigator.getResult()
+                    if result == TaskResult.SUCCEEDED:
+                        # Try to offload
+                        rqt = ItemRequest.Request()
+                        rqt.robot_id = self.robot_id
+                        try:
+                            future = self.offload_service.call_async(rqt)
+                            rclpy.spin_until_future_complete(self, future)
+                            response = future.result()
+                            if response.success:
+                                self.get_logger().info('Successfully offloaded item!')
+                                self.offload_started = False
+                                self.state = State.FORWARD
+                            else:
+                                self.get_logger().info('Failed to offload item: ' + response.message)
+                        except Exception as e:
+                            self.get_logger().info(f'Service call failed: {str(e)}')
+                    else:
+                        self.get_logger().warn(f'Navigation failed with result: {result}')
+                        self.offload_started = False
+                        self.state = State.FORWARD
                 else:
-                    self.get_logger().warn(f'Navigation failed with result: {result}')
-                    self.navigation_started = False
-                    self.state = State.FORWARD
+                    # Still navigating, provide feedback
+                    feedback = self.navigator.getFeedback()
+                    if feedback and feedback.distance_remaining:
+                        self.get_logger().info(f'Distance remaining: {feedback.distance_remaining:.2f}m')
             case _:
                 pass
         
