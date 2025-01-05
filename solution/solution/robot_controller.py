@@ -54,96 +54,115 @@ class State(Enum):
     FORWARD = 0
     TURNING = 1
     COLLECTING = 2
-    OFFLOADING = 3
+    NAVIGATING_TO_ZONE = 3
+    OFFLOADING = 4
 
-# Define zones and their positions
-ZONES = {
-    'Zone1': (-2.0, 2.0),
-    'Zone2': (2.0, 2.0),
-    'Zone3': (2.0, -2.0),
-    'Zone4': (-2.0, -2.0)
-}
-
-# Color to zone mapping
-COLOR_TO_ZONE = {
-    'red': 'Zone1',
-    'green': 'Zone2',
-    'blue': 'Zone3',
-    'yellow': 'Zone4'
-}
 
 class RobotController(Node):
 
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Class variables
-        self.state = State.FORWARD
-        self.pose = Pose()
-        self.previous_pose = Pose()
-        self.yaw = 0.0
-        self.previous_yaw = 0.0
-        self.turn_angle = 0.0
-        self.turn_direction = TURN_LEFT
-        self.goal_distance = random.uniform(1.0, 2.0)
-        self.scan_triggered = [False] * 4
+        # Class variables used to store persistent values between executions of callbacks and control loop
+        self.state = State.FORWARD # Current FSM state
+        self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
+        self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
+        self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
+        self.previous_yaw = 0.0 # Snapshot of the angle for comparison against future angles
+        self.turn_angle = 0.0 # Relative angle to turn to in the TURNING state
+        self.turn_direction = TURN_LEFT # Direction to turn in the TURNING state
+        self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
+        self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
         self.items = ItemList()
-        self.current_item_color = None
-        
-        # Parameters
+
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
-        
-        # Create callback groups
+
+        # Here we use two callback groups, to ensure that those in 'client_callback_group' can be executed
+        # independently from those in 'timer_callback_group'. This allos calling the services below within
+        # a callback handled by the timer_callback_group. See https://docs.ros.org/en/humble/How-To-Guides/Using-callback-groups.html
+        # for a detailed discussion on the ROS executors and callback groups.
         client_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
-        
-        # Publishers
-        self.cmd_vel_publisher = self.create_publisher(
-            Twist, 
-            '/cmd_vel', 
-            10
-        )
-        
-        # Subscribers
-        self.odom_subscriber = self.create_subscription(
-            Odometry,
-            '/odom',
-            self.odom_callback,
-            10
-        )
-        
-        self.scan_subscriber = self.create_subscription(
-            LaserScan,
-            '/scan',
-            self.scan_callback,
-            10
-        )
-        
+
+        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
+        self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
+
         self.item_subscriber = self.create_subscription(
             ItemList,
-            '/items',
+            'items',
             self.item_callback,
-            10
+            10, callback_group=timer_callback_group
         )
+
+        # Subscribes to Odometry messages published on /odom topic
+        # http://docs.ros.org/en/noetic/api/nav_msgs/html/msg/Odometry.html
+        #
+        # Final argument can either be an integer representing the history depth, or a Quality of Service (QoS) profile
+        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1335-L1338
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1187-L1196
+        #
+        # If you only specify a history depth, rclpy defaults to QoSHistoryPolicy.KEEP_LAST
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L80-L83
+        self.odom_subscriber = self.create_subscription(
+            Odometry,
+            'odom',
+            self.odom_callback,
+            10, callback_group=timer_callback_group)
         
-        # Services with callback groups
-        self.pick_up_service = self.create_client(
-            ItemRequest, 
-            '/pick_up_item',
-            callback_group=client_callback_group
-        )
+        # Subscribes to LaserScan messages on the /scan topic
+        # http://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/LaserScan.html
+        #
+        # QoSPresetProfiles.SENSOR_DATA specifices "best effort" reliability and a small queue size
+        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L455
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L428-L431
+        self.scan_subscriber = self.create_subscription(
+            LaserScan,
+            'scan',
+            self.scan_callback,
+            QoSPresetProfiles.SENSOR_DATA.value, callback_group=timer_callback_group)
+
+        # Publishes Twist messages (linear and angular velocities) on the /cmd_vel topic
+        # http://docs.ros.org/en/noetic/api/geometry_msgs/html/msg/Twist.html
+        # 
+        # Gazebo ROS differential drive plugin subscribes to these messages, and converts them into left and right wheel speeds
+        # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L537-L555
+        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+
+        #self.orientation_publisher = self.create_publisher(Float32, '/orientation', 10)
+
+        # Publishes custom StringWithPose (see auro_interfaces/msg/StringWithPose.msg) messages on the /marker_input topic
+        # The week3/rviz_text_marker node subscribes to these messages, and ouputs a Marker message on the /marker_output topic
+        # ros2 run week_3 rviz_text_marker
+        # This can be visualised in RViz: Add > By topic > /marker_output
+        #
+        # http://docs.ros.org/en/noetic/api/visualization_msgs/html/msg/Marker.html
+        # http://wiki.ros.org/rviz/DisplayTypes/Marker
+        self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10, callback_group=timer_callback_group)
+
+        # Creates a timer that calls the control_loop method repeatedly - each loop represents single iteration of the FSM
+        self.timer_period = 0.1 # 100 milliseconds = 10 Hz
+        self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
+
+        # Add new variables for zone handling
+        self.holding_item = False
+        self.item_color = None
+        self.target_zone = None
+        self.zones = {
+            'cyan': {'x': -3.5, 'y': 2.5},      # Bottom left
+            'purple': {'x': -3.5, 'y': -2.5},    # Bottom right
+            'deeppink': {'x': 2.5, 'y': 2.5},    # Top left
+            'seagreen': {'x': 2.5, 'y': -2.5}    # Top right
+        }
         
-        self.offload_service = self.create_client(
-            ItemRequest, 
-            '/offload_item',
-            callback_group=client_callback_group
-        )
-        
-        # Timer with callback group
-        self.timer = self.create_timer(
-            0.1, 
-            self.control_loop,
+        # Subscribe to zone information
+        self.zone_subscriber = self.create_subscription(
+            ZoneList,
+            'zones',
+            self.zone_callback,
+            10,
             callback_group=timer_callback_group
         )
 
@@ -323,13 +342,11 @@ class RobotController(Node):
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Successfully picked up item!')
-                            self.current_item_color = closest_item.colour
-                            self.items.data = []  # Clear items list after pickup
-                            self.state = State.OFFLOADING
-                            return
+                            self.holding_item = True
+                            self.item_color = closest_item.colour
+                            self.state = State.NAVIGATING_TO_ZONE
                         else:
                             self.get_logger().info('Failed to pick up item: ' + response.message)
-                            # Move slightly closer if pickup failed
                             msg.linear.x = 0.05
                             self.cmd_vel_publisher.publish(msg)
                     except Exception as e:
@@ -339,46 +356,60 @@ class RobotController(Node):
                     msg.linear.x = 0.25 * estimated_distance  # Proportional to distance
                     msg.angular.z = angle_to_item  # Proportional to angle offset
                     self.cmd_vel_publisher.publish(msg)
-            case State.OFFLOADING:
-                # Get the target zone for this item's color
-                target_zone = COLOR_TO_ZONE.get(self.current_item_color)
-                if not target_zone:
-                    self.get_logger().error(f'No zone mapping for color {self.current_item_color}')
+
+            case State.NAVIGATING_TO_ZONE:
+                if not self.holding_item:
                     self.state = State.FORWARD
                     return
-                
-                zone_pos = ZONES[target_zone]
-                
-                # Calculate distance to target zone
-                dx = zone_pos[0] - self.pose.position.x
-                dy = zone_pos[1] - self.pose.position.y
-                distance = math.sqrt(dx**2 + dy**2)
-                
-                if distance < 0.5:  # Close enough to zone
-                    # Try to offload
-                    rqt = ItemRequest.Request()
-                    rqt.robot_id = self.robot_id
-                    try:
-                        future = self.offload_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
-                        response = future.result()
-                        if response.success:
-                            self.get_logger().info(f'Successfully offloaded {self.current_item_color} item in {target_zone} zone!')
-                            self.current_item_color = None
-                            self.state = State.FORWARD
-                        else:
-                            self.get_logger().info('Failed to offload item: ' + response.message)
-                    except Exception as e:
-                        self.get_logger().info(f'Service call failed: {str(e)}')
-                else:
-                    # Move towards zone
+                    
+                target = self.get_nearest_zone()
+                if target:
+                    target_pos = self.zones[target]
+                    dx = target_pos['x'] - self.pose.position.x
+                    dy = target_pos['y'] - self.pose.position.y
+                    distance = math.sqrt(dx*dx + dy*dy)
+                    
+                    if distance < 0.5:  # Close enough to offload
+                        self.state = State.OFFLOADING
+                        return
+                        
+                    # Navigate towards zone
+                    angle_to_target = math.atan2(dy, dx)
+                    angle_diff = angles.normalize_angle(angle_to_target - self.yaw)
+                    
                     msg = Twist()
-                    msg.linear.x = min(LINEAR_VELOCITY, distance * 0.5)
-                    # Calculate angle to zone
-                    target_angle = math.atan2(dy, dx)
-                    angle_diff = angles.normalize_angle(target_angle - self.yaw)
-                    msg.angular.z = max(-ANGULAR_VELOCITY, min(ANGULAR_VELOCITY, angle_diff))
+                    if abs(angle_diff) > 0.1:
+                        msg.angular.z = 0.3 * angle_diff
+                    else:
+                        msg.linear.x = 0.2
                     self.cmd_vel_publisher.publish(msg)
+
+            case State.OFFLOADING:
+                if not self.holding_item:
+                    self.state = State.FORWARD
+                    return
+                    
+                msg = Twist()
+                self.cmd_vel_publisher.publish(msg)
+                
+                rqt = ItemRequest.Request()
+                rqt.robot_id = self.robot_id
+                try:
+                    future = self.offload_service.call_async(rqt)
+                    rclpy.spin_until_future_complete(self, future)
+                    response = future.result()
+                    if response.success:
+                        self.get_logger().info('Successfully offloaded item!')
+                        self.holding_item = False
+                        self.item_color = None
+                        self.state = State.FORWARD
+                    else:
+                        self.get_logger().info('Failed to offload item: ' + response.message)
+                        # Try a slightly different position
+                        self.state = State.NAVIGATING_TO_ZONE
+                except Exception as e:
+                    self.get_logger().info(f'Service call failed: {str(e)}')
+
             case _:
                 pass
         
@@ -388,6 +419,27 @@ class RobotController(Node):
         self.get_logger().info(f"Stopping: {msg}")
         super().destroy_node()
 
+    def zone_callback(self, msg):
+        # Update zone information if needed
+        for zone in msg.data:
+            if zone.colour in self.zones:
+                # Update zone status/availability if needed
+                pass
+
+    def get_nearest_zone(self):
+        # Find closest compatible zone for current item
+        min_dist = float('inf')
+        nearest = None
+        
+        for color, pos in self.zones.items():
+            dx = pos['x'] - self.pose.position.x
+            dy = pos['y'] - self.pose.position.y
+            dist = math.sqrt(dx*dx + dy*dy)
+            if dist < min_dist:
+                min_dist = dist
+                nearest = color
+        
+        return nearest
 
 def main(args=None):
 
