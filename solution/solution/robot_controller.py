@@ -275,7 +275,7 @@ class RobotController(Node):
                     rqt.robot_id = self.robot_id
                     try:
                         future = self.pick_up_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
+                        self.executor.spin_until_future_complete(future)
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Successfully picked up item!')
@@ -306,6 +306,8 @@ class RobotController(Node):
                     dy = target_pos['y'] - self.pose.position.y
                     distance = math.sqrt(dx*dx + dy*dy)
                     
+                    self.get_logger().info(f'Navigating to {target} zone, distance: {distance:.2f}m')
+                    
                     if distance < 0.5:
                         self.state = State.OFFLOADING
                         return
@@ -317,14 +319,15 @@ class RobotController(Node):
                     if abs(angle_diff) > 0.1:
                         msg.angular.z = max(-0.3, min(0.3, angle_diff))
                     else:
-                        msg.linear.x = 0.2
+                        msg.linear.x = max(0.1, min(0.3, 0.2 * distance))
                         msg.angular.z = 0.1 * angle_diff
                     
                     self.cmd_vel_publisher.publish(msg)
                 else:
-                    # Just move forward if no zone found
+                    # Explore to find zones
                     msg = Twist()
                     msg.linear.x = LINEAR_VELOCITY
+                    msg.angular.z = TURN_LEFT * ANGULAR_VELOCITY * 0.2
                     self.cmd_vel_publisher.publish(msg)
 
             case State.OFFLOADING:
@@ -339,7 +342,7 @@ class RobotController(Node):
                 rqt.robot_id = self.robot_id
                 try:
                     future = self.offload_service.call_async(rqt)
-                    rclpy.spin_until_future_complete(self, future)
+                    self.executor.spin_until_future_complete(future)
                     response = future.result()
                     if response.success:
                         self.get_logger().info('Successfully offloaded item!')
@@ -387,15 +390,23 @@ class RobotController(Node):
         return nearest
 
 def main(args=None):
-    rclpy.init(args=args)
-    robot_controller = RobotController()
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    
+    node = RobotController()
+    executor = MultiThreadedExecutor()
+    node.executor = executor  # Store executor reference
+    executor.add_node(node)
+    
     try:
-        rclpy.spin(robot_controller)
+        executor.spin()
     except KeyboardInterrupt:
         pass
+    except ExternalShutdownException:
+        sys.exit(1)
     finally:
-        robot_controller.destroy_node()
-        rclpy.shutdown()
-
+        node.destroy_node()
+        rclpy.try_shutdown()
+        
+        
 if __name__ == '__main__':
     main()
