@@ -63,93 +63,32 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Add initialization check
-        self.get_logger().info('Initializing robot controller...')
-        
-        # Class variables used to store persistent values between executions of callbacks and control loop
-        self.state = State.FORWARD # Current FSM state
-        self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
-        self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
-        self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
-        self.previous_yaw = 0.0 # Snapshot of the angle for comparison against future angles
-        self.turn_angle = 0.0 # Relative angle to turn to in the TURNING state
-        self.turn_direction = TURN_LEFT # Direction to turn in the TURNING state
-        self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
-        self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
+        # Basic initialization
+        self.state = State.FORWARD
+        self.pose = Pose()
+        self.yaw = 0.0
         self.items = ItemList()
-
+        self.holding_item = False
+        self.item_color = None
+        
+        # Robot ID
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
-
-        # Here we use two callback groups, to ensure that those in 'client_callback_group' can be executed
-        # independently from those in 'timer_callback_group'. This allos calling the services below within
-        # a callback handled by the timer_callback_group. See https://docs.ros.org/en/humble/How-To-Guides/Using-callback-groups.html
-        # for a detailed discussion on the ROS executors and callback groups.
-        client_callback_group = MutuallyExclusiveCallbackGroup()
-        timer_callback_group = MutuallyExclusiveCallbackGroup()
-
-        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
-        self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
-
-        self.item_subscriber = self.create_subscription(
-            ItemList,
-            'items',
-            self.item_callback,
-            10, callback_group=timer_callback_group
-        )
-
-        # Subscribes to Odometry messages published on /odom topic
-        # http://docs.ros.org/en/noetic/api/nav_msgs/html/msg/Odometry.html
-        #
-        # Final argument can either be an integer representing the history depth, or a Quality of Service (QoS) profile
-        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1335-L1338
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1187-L1196
-        #
-        # If you only specify a history depth, rclpy defaults to QoSHistoryPolicy.KEEP_LAST
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L80-L83
-        self.odom_subscriber = self.create_subscription(
-            Odometry,
-            'odom',
-            self.odom_callback,
-            10, callback_group=timer_callback_group)
         
-        # Subscribes to LaserScan messages on the /scan topic
-        # http://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/LaserScan.html
-        #
-        # QoSPresetProfiles.SENSOR_DATA specifices "best effort" reliability and a small queue size
-        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L455
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L428-L431
-        self.scan_subscriber = self.create_subscription(
-            LaserScan,
-            'scan',
-            self.scan_callback,
-            QoSPresetProfiles.SENSOR_DATA.value, callback_group=timer_callback_group)
-
-        # Publishes Twist messages (linear and angular velocities) on the /cmd_vel topic
-        # http://docs.ros.org/en/noetic/api/geometry_msgs/html/msg/Twist.html
-        # 
-        # Gazebo ROS differential drive plugin subscribes to these messages, and converts them into left and right wheel speeds
-        # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L537-L555
+        # Basic publishers and subscribers
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
-
-        #self.orientation_publisher = self.create_publisher(Float32, '/orientation', 10)
-
-        # Publishes custom StringWithPose (see auro_interfaces/msg/StringWithPose.msg) messages on the /marker_input topic
-        # The week3/rviz_text_marker node subscribes to these messages, and ouputs a Marker message on the /marker_output topic
-        # ros2 run week_3 rviz_text_marker
-        # This can be visualised in RViz: Add > By topic > /marker_output
-        #
-        # http://docs.ros.org/en/noetic/api/visualization_msgs/html/msg/Marker.html
-        # http://wiki.ros.org/rviz/DisplayTypes/Marker
-        self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10, callback_group=timer_callback_group)
-
-        # Creates a timer that calls the control_loop method repeatedly - each loop represents single iteration of the FSM
-        self.timer_period = 0.1 # 100 milliseconds = 10 Hz
-        self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
-
-        # Simplified zone positions
+        self.odom_subscriber = self.create_subscription(Odometry, 'odom', self.odom_callback, 10)
+        self.item_subscriber = self.create_subscription(ItemList, 'items', self.item_callback, 10)
+        
+        # Services
+        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item')
+        self.offload_service = self.create_client(ItemRequest, '/offload_item')
+        
+        # Timer
+        self.timer_period = 0.1
+        self.timer = self.create_timer(self.timer_period, self.control_loop)
+        
+        # Simple zone positions
         self.zones = {
             'cyan': {'x': -2.5, 'y': 2.5},
             'purple': {'x': -2.5, 'y': -2.5},
@@ -157,21 +96,7 @@ class RobotController(Node):
             'seagreen': {'x': 2.5, 'y': -2.5}
         }
         
-        self.holding_item = False
-        self.item_color = None
-
-        # Subscribe to zone information
-        self.zone_subscriber = self.create_subscription(
-            ZoneList,
-            'zones',
-            self.zone_callback,
-            10,
-            callback_group=timer_callback_group
-        )
-
-        self.get_logger().info(f'Robot controller initialized with ID: {self.robot_id}')
-        self.get_logger().info(f'Initial position: ({self.pose.position.x:.2f}, {self.pose.position.y:.2f})')
-        self.get_logger().info(f'Initial state: {self.state}')
+        self.get_logger().info('Robot controller initialized')
 
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
@@ -463,17 +388,13 @@ class RobotController(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    
+    robot_controller = RobotController()
     try:
-        robot_controller = RobotController()
         rclpy.spin(robot_controller)
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        print(f'Error occurred: {str(e)}')
     finally:
-        if 'robot_controller' in locals():
-            robot_controller.destroy_node()
+        robot_controller.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':
