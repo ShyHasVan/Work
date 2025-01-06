@@ -154,10 +154,10 @@ class RobotController(Node):
         self.item_color = None
         self.target_zone = None
         self.zones = {
-            'cyan': {'x': -3.0, 'y': 3.0},      # Bottom left
-            'purple': {'x': 3.0, 'y': -3.0},    # Bottom right
-            'deeppink': {'x': 3.0, 'y': 3.0},   # Top right
-            'seagreen': {'x': -3.0, 'y': -3.0}  # Top left
+            'cyan': {'x': -2.5, 'y': 2.5},      # Top left
+            'purple': {'x': -2.5, 'y': -2.5},    # Bottom left
+            'deeppink': {'x': 2.5, 'y': 2.5},    # Top right
+            'seagreen': {'x': 2.5, 'y': -2.5}    # Bottom right
         }
         
         # Subscribe to zone information
@@ -381,11 +381,10 @@ class RobotController(Node):
                     dy = target_pos['y'] - self.pose.position.y
                     distance = math.sqrt(dx*dx + dy*dy)
                     
-                    # Add debug logging
                     self.get_logger().info(f'Navigating to {target} zone at ({target_pos["x"]}, {target_pos["y"]}), ' +
                                           f'distance: {distance:.2f}m')
                     
-                    if distance < 0.5:  # Close enough to offload
+                    if distance < 0.5:  # Within ZONE_SIZE from item_manager.py
                         self.state = State.OFFLOADING
                         return
                         
@@ -394,13 +393,19 @@ class RobotController(Node):
                     angle_diff = angles.normalize_angle(angle_to_target - self.yaw)
                     
                     msg = Twist()
-                    if abs(angle_diff) > 0.1:  # First align with target
-                        msg.angular.z = max(-0.5, min(0.5, angle_diff))  # Limit turning rate
-                        self.get_logger().info(f'Turning to align, angle diff: {math.degrees(angle_diff):.2f}°')
+                    if abs(angle_diff) > 0.2:  # First align with target
+                        msg.angular.z = max(-0.3, min(0.3, angle_diff))
                     else:  # Then move forward
-                        msg.linear.x = max(0.1, min(0.3, 0.2 * distance))  # Proportional to distance
-                        msg.angular.z = 0.1 * angle_diff  # Small correction while moving
-                        self.get_logger().info(f'Moving toward zone, speed: {msg.linear.x:.2f}m/s')
+                        msg.linear.x = max(0.1, min(0.2, 0.3 * distance))
+                        msg.angular.z = 0.2 * angle_diff  # Small correction while moving
+                    
+                    self.cmd_vel_publisher.publish(msg)
+                else:
+                    # No suitable zone found, explore to find one
+                    self.get_logger().info('No suitable zone found, exploring...')
+                    msg = Twist()
+                    msg.linear.x = LINEAR_VELOCITY
+                    msg.angular.z = TURN_LEFT * ANGULAR_VELOCITY * 0.2  # Slow turn while moving
                     self.cmd_vel_publisher.publish(msg)
 
             case State.OFFLOADING:
@@ -442,35 +447,42 @@ class RobotController(Node):
         self.get_logger().info('Received zone update')
         for zone in msg.data:
             if zone.colour in self.zones:
-                # Store the zone's current color assignment if it has one
-                self.zones[zone.colour]['assigned_color'] = zone.assigned_colour if zone.assigned_colour else None
-                self.get_logger().info(f'Zone {zone.colour} status - Assigned color: {zone.assigned_colour}')
+                # Update zone position and assignment
+                self.zones[zone.colour]['x'] = zone.x
+                self.zones[zone.colour]['y'] = zone.y
+                if zone.assigned_colour:
+                    self.zones[zone.colour]['assigned_color'] = zone.assigned_colour
+                    self.get_logger().info(f'Zone {zone.colour} is assigned to {zone.assigned_colour}')
+                else:
+                    self.zones[zone.colour]['assigned_color'] = None
 
     def get_nearest_zone(self):
         min_dist = float('inf')
         nearest = None
         
+        # First priority: zones matching our item color
         for color, pos in self.zones.items():
-            # Check if zone is compatible with our item
             assigned_color = pos.get('assigned_color')
-            if assigned_color is not None and assigned_color != self.item_color:
-                self.get_logger().info(f'Zone {color} is assigned to {assigned_color}, we have {self.item_color}')
-                continue
-            
-            dx = pos['x'] - self.pose.position.x
-            dy = pos['y'] - self.pose.position.y
-            dist = math.sqrt(dx*dx + dy*dy)
-            
-            self.get_logger().info(f'Zone {color}: distance = {dist:.2f}m, assigned = {assigned_color}')
-            
-            if dist < min_dist:
-                min_dist = dist
-                nearest = color
+            if assigned_color == self.item_color:
+                dx = pos['x'] - self.pose.position.x
+                dy = pos['y'] - self.pose.position.y
+                dist = math.sqrt(dx*dx + dy*dy)
+                
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest = color
         
-        if nearest:
-            self.get_logger().info(f'Selected zone {nearest} at distance {min_dist:.2f}m')
-        else:
-            self.get_logger().info('No suitable zone found')
+        # Second priority: unassigned zones
+        if nearest is None:
+            for color, pos in self.zones.items():
+                if pos.get('assigned_color') is None:
+                    dx = pos['x'] - self.pose.position.x
+                    dy = pos['y'] - self.pose.position.y
+                    dist = math.sqrt(dx*dx + dy*dy)
+                    
+                    if dist < min_dist:
+                        min_dist = dist
+                        nearest = color
         
         return nearest
 
