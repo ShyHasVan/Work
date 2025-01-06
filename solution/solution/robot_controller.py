@@ -13,7 +13,6 @@
 #
  
 import sys
-
 import rclpy
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
@@ -21,11 +20,10 @@ from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.qos import QoSPresetProfiles
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
-from std_msgs.msg import Float32
 from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from assessment_interfaces.msg import Item, ItemList, Zone, ZoneList
+from assessment_interfaces.msg import ItemList, ZoneList
 from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
 
@@ -66,7 +64,13 @@ class RobotController(Node):
         # Basic initialization
         self.state = State.FORWARD
         self.pose = Pose()
+        self.previous_pose = Pose()
         self.yaw = 0.0
+        self.previous_yaw = 0.0
+        self.turn_angle = 0.0
+        self.turn_direction = TURN_LEFT
+        self.goal_distance = random.uniform(1.0, 2.0)
+        self.scan_triggered = [False] * 4
         self.items = ItemList()
         self.holding_item = False
         self.item_color = None
@@ -75,18 +79,21 @@ class RobotController(Node):
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
         
-        # Basic publishers and subscribers
-        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
-        self.odom_subscriber = self.create_subscription(Odometry, 'odom', self.odom_callback, 10)
-        self.item_subscriber = self.create_subscription(ItemList, 'items', self.item_callback, 10)
+        # Publishers and subscribers
+        self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10)
+        
+        self.odom_subscriber = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+        self.scan_subscriber = self.create_subscription(LaserScan, '/scan', self.scan_callback, QoSPresetProfiles.SENSOR_DATA.value)
+        self.item_subscriber = self.create_subscription(ItemList, '/items', self.item_callback, 10)
+        self.zone_subscriber = self.create_subscription(ZoneList, '/zones', self.zone_callback, 10)
         
         # Services
         self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item')
         self.offload_service = self.create_client(ItemRequest, '/offload_item')
         
         # Timer
-        self.timer_period = 0.1
-        self.timer = self.create_timer(self.timer_period, self.control_loop)
+        self.timer = self.create_timer(0.1, self.control_loop)
         
         # Simple zone positions
         self.zones = {
@@ -139,18 +146,14 @@ class RobotController(Node):
     # http://wiki.ros.org/hls_lfcd_lds_driver
     # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/blob/humble-devel/turtlebot3_gazebo/models/turtlebot3_waffle_pi/model.sdf#L132-L165
     def scan_callback(self, msg):
-        # Group scan ranges into 4 segments
-        # Front, left, and right segments are each 60 degrees
-        # Back segment is 180 degrees
-        front_ranges = msg.ranges[331:359] + msg.ranges[0:30] # 30 to 331 degrees (30 to -30 degrees)
-        left_ranges  = msg.ranges[31:90] # 31 to 90 degrees (31 to 90 degrees)
-        back_ranges  = msg.ranges[91:270] # 91 to 270 degrees (91 to -90 degrees)
-        right_ranges = msg.ranges[271:330] # 271 to 330 degrees (-30 to -91 degrees)
-
-        # Store True/False values for each sensor segment, based on whether the nearest detected obstacle is closer than SCAN_THRESHOLD
-        self.scan_triggered[SCAN_FRONT] = min(front_ranges) < SCAN_THRESHOLD 
-        self.scan_triggered[SCAN_LEFT]  = min(left_ranges)  < SCAN_THRESHOLD
-        self.scan_triggered[SCAN_BACK]  = min(back_ranges)  < SCAN_THRESHOLD
+        front_ranges = msg.ranges[331:359] + msg.ranges[0:30]
+        left_ranges = msg.ranges[31:90]
+        back_ranges = msg.ranges[91:270]
+        right_ranges = msg.ranges[271:330]
+        
+        self.scan_triggered[SCAN_FRONT] = min(front_ranges) < SCAN_THRESHOLD
+        self.scan_triggered[SCAN_LEFT] = min(left_ranges) < SCAN_THRESHOLD
+        self.scan_triggered[SCAN_BACK] = min(back_ranges) < SCAN_THRESHOLD
         self.scan_triggered[SCAN_RIGHT] = min(right_ranges) < SCAN_THRESHOLD
 
 
