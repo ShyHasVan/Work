@@ -1,4 +1,3 @@
-
 #
 # Copyright (c) 2024 University of York and others
 #
@@ -382,6 +381,10 @@ class RobotController(Node):
                     dy = target_pos['y'] - self.pose.position.y
                     distance = math.sqrt(dx*dx + dy*dy)
                     
+                    # Add debug logging
+                    self.get_logger().info(f'Navigating to {target} zone at ({target_pos["x"]}, {target_pos["y"]}), ' +
+                                          f'distance: {distance:.2f}m')
+                    
                     if distance < 0.5:  # Close enough to offload
                         self.state = State.OFFLOADING
                         return
@@ -391,10 +394,13 @@ class RobotController(Node):
                     angle_diff = angles.normalize_angle(angle_to_target - self.yaw)
                     
                     msg = Twist()
-                    if abs(angle_diff) > 0.1:
-                        msg.angular.z = 0.3 * angle_diff
-                    else:
-                        msg.linear.x = 0.2
+                    if abs(angle_diff) > 0.1:  # First align with target
+                        msg.angular.z = max(-0.5, min(0.5, angle_diff))  # Limit turning rate
+                        self.get_logger().info(f'Turning to align, angle diff: {math.degrees(angle_diff):.2f}°')
+                    else:  # Then move forward
+                        msg.linear.x = max(0.1, min(0.3, 0.2 * distance))  # Proportional to distance
+                        msg.angular.z = 0.1 * angle_diff  # Small correction while moving
+                        self.get_logger().info(f'Moving toward zone, speed: {msg.linear.x:.2f}m/s')
                     self.cmd_vel_publisher.publish(msg)
 
             case State.OFFLOADING:
@@ -441,17 +447,21 @@ class RobotController(Node):
                 self.get_logger().info(f'Zone {zone.colour} status - Assigned color: {zone.assigned_colour}')
 
     def get_nearest_zone(self):
-        # Find closest compatible zone for current item
         min_dist = float('inf')
         nearest = None
         
         for color, pos in self.zones.items():
+            # Check if zone is compatible with our item
+            assigned_color = pos.get('assigned_color')
+            if assigned_color is not None and assigned_color != self.item_color:
+                self.get_logger().info(f'Zone {color} is assigned to {assigned_color}, we have {self.item_color}')
+                continue
+            
             dx = pos['x'] - self.pose.position.x
             dy = pos['y'] - self.pose.position.y
             dist = math.sqrt(dx*dx + dy*dy)
             
-            # Log zone distances for debugging
-            self.get_logger().info(f'Zone {color}: distance = {dist:.2f}m')
+            self.get_logger().info(f'Zone {color}: distance = {dist:.2f}m, assigned = {assigned_color}')
             
             if dist < min_dist:
                 min_dist = dist
