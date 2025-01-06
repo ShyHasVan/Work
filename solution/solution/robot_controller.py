@@ -1,3 +1,4 @@
+
 #
 # Copyright (c) 2024 University of York and others
 #
@@ -13,6 +14,7 @@
 #
  
 import sys
+
 import rclpy
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
@@ -20,10 +22,11 @@ from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.qos import QoSPresetProfiles
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
+from std_msgs.msg import Float32
 from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from assessment_interfaces.msg import ItemList, ZoneList
+from assessment_interfaces.msg import Item, ItemList, Zone, ZoneList
 from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
 
@@ -61,49 +64,115 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Basic initialization
-        self.state = State.FORWARD
-        self.pose = Pose()
-        self.previous_pose = Pose()
-        self.yaw = 0.0
-        self.previous_yaw = 0.0
-        self.turn_angle = 0.0
-        self.turn_direction = TURN_LEFT
-        self.goal_distance = random.uniform(1.0, 2.0)
-        self.scan_triggered = [False] * 4
-        self.items = ItemList()
-        self.holding_item = False
-        self.item_color = None
+        # Add initialization check
+        self.get_logger().info('Initializing robot controller...')
         
-        # Robot ID
+        # Class variables used to store persistent values between executions of callbacks and control loop
+        self.state = State.FORWARD # Current FSM state
+        self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
+        self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
+        self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
+        self.previous_yaw = 0.0 # Snapshot of the angle for comparison against future angles
+        self.turn_angle = 0.0 # Relative angle to turn to in the TURNING state
+        self.turn_direction = TURN_LEFT # Direction to turn in the TURNING state
+        self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
+        self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
+        self.items = ItemList()
+
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
+
+        # Here we use two callback groups, to ensure that those in 'client_callback_group' can be executed
+        # independently from those in 'timer_callback_group'. This allos calling the services below within
+        # a callback handled by the timer_callback_group. See https://docs.ros.org/en/humble/How-To-Guides/Using-callback-groups.html
+        # for a detailed discussion on the ROS executors and callback groups.
+        client_callback_group = MutuallyExclusiveCallbackGroup()
+        timer_callback_group = MutuallyExclusiveCallbackGroup()
+
+        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
+        self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
+
+        self.item_subscriber = self.create_subscription(
+            ItemList,
+            'items',
+            self.item_callback,
+            10, callback_group=timer_callback_group
+        )
+
+        # Subscribes to Odometry messages published on /odom topic
+        # http://docs.ros.org/en/noetic/api/nav_msgs/html/msg/Odometry.html
+        #
+        # Final argument can either be an integer representing the history depth, or a Quality of Service (QoS) profile
+        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1335-L1338
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1187-L1196
+        #
+        # If you only specify a history depth, rclpy defaults to QoSHistoryPolicy.KEEP_LAST
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L80-L83
+        self.odom_subscriber = self.create_subscription(
+            Odometry,
+            'odom',
+            self.odom_callback,
+            10, callback_group=timer_callback_group)
         
-        # Publishers and subscribers
-        self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.marker_publisher = self.create_publisher(StringWithPose, '/marker_input', 10)
-        
-        self.odom_subscriber = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
-        self.scan_subscriber = self.create_subscription(LaserScan, '/scan', self.scan_callback, QoSPresetProfiles.SENSOR_DATA.value)
-        self.item_subscriber = self.create_subscription(ItemList, '/items', self.item_callback, 10)
-        self.zone_subscriber = self.create_subscription(ZoneList, '/zones', self.zone_callback, 10)
-        
-        # Services
-        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item')
-        self.offload_service = self.create_client(ItemRequest, '/offload_item')
-        
-        # Timer for control loop
-        self.timer = self.create_timer(0.1, self.control_loop)
-        
-        # Simple zone positions
+        # Subscribes to LaserScan messages on the /scan topic
+        # http://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/LaserScan.html
+        #
+        # QoSPresetProfiles.SENSOR_DATA specifices "best effort" reliability and a small queue size
+        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L455
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L428-L431
+        self.scan_subscriber = self.create_subscription(
+            LaserScan,
+            'scan',
+            self.scan_callback,
+            QoSPresetProfiles.SENSOR_DATA.value, callback_group=timer_callback_group)
+
+        # Publishes Twist messages (linear and angular velocities) on the /cmd_vel topic
+        # http://docs.ros.org/en/noetic/api/geometry_msgs/html/msg/Twist.html
+        # 
+        # Gazebo ROS differential drive plugin subscribes to these messages, and converts them into left and right wheel speeds
+        # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L537-L555
+        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+
+        #self.orientation_publisher = self.create_publisher(Float32, '/orientation', 10)
+
+        # Publishes custom StringWithPose (see auro_interfaces/msg/StringWithPose.msg) messages on the /marker_input topic
+        # The week3/rviz_text_marker node subscribes to these messages, and ouputs a Marker message on the /marker_output topic
+        # ros2 run week_3 rviz_text_marker
+        # This can be visualised in RViz: Add > By topic > /marker_output
+        #
+        # http://docs.ros.org/en/noetic/api/visualization_msgs/html/msg/Marker.html
+        # http://wiki.ros.org/rviz/DisplayTypes/Marker
+        self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10, callback_group=timer_callback_group)
+
+        # Creates a timer that calls the control_loop method repeatedly - each loop represents single iteration of the FSM
+        self.timer_period = 0.1 # 100 milliseconds = 10 Hz
+        self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
+
+        # Add new variables for zone handling
+        self.holding_item = False
+        self.item_color = None
+        self.target_zone = None
         self.zones = {
-            'cyan': {'x': -2.5, 'y': 2.5},
-            'purple': {'x': -2.5, 'y': -2.5},
-            'deeppink': {'x': 2.5, 'y': 2.5},
-            'seagreen': {'x': 2.5, 'y': -2.5}
+            'cyan': {'x': -3.0, 'y': 3.0},      # Bottom left
+            'purple': {'x': 3.0, 'y': -3.0},    # Bottom right
+            'deeppink': {'x': 3.0, 'y': 3.0},   # Top right
+            'seagreen': {'x': -3.0, 'y': -3.0}  # Top left
         }
         
-        self.get_logger().info('Robot controller initialized')
+        # Subscribe to zone information
+        self.zone_subscriber = self.create_subscription(
+            ZoneList,
+            'zones',
+            self.zone_callback,
+            10,
+            callback_group=timer_callback_group
+        )
+
+        self.get_logger().info(f'Robot controller initialized with ID: {self.robot_id}')
+        self.get_logger().info(f'Initial position: ({self.pose.position.x:.2f}, {self.pose.position.y:.2f})')
+        self.get_logger().info(f'Initial state: {self.state}')
 
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
@@ -146,14 +215,18 @@ class RobotController(Node):
     # http://wiki.ros.org/hls_lfcd_lds_driver
     # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/blob/humble-devel/turtlebot3_gazebo/models/turtlebot3_waffle_pi/model.sdf#L132-L165
     def scan_callback(self, msg):
-        front_ranges = msg.ranges[331:359] + msg.ranges[0:30]
-        left_ranges = msg.ranges[31:90]
-        back_ranges = msg.ranges[91:270]
-        right_ranges = msg.ranges[271:330]
-        
-        self.scan_triggered[SCAN_FRONT] = min(front_ranges) < SCAN_THRESHOLD
-        self.scan_triggered[SCAN_LEFT] = min(left_ranges) < SCAN_THRESHOLD
-        self.scan_triggered[SCAN_BACK] = min(back_ranges) < SCAN_THRESHOLD
+        # Group scan ranges into 4 segments
+        # Front, left, and right segments are each 60 degrees
+        # Back segment is 180 degrees
+        front_ranges = msg.ranges[331:359] + msg.ranges[0:30] # 30 to 331 degrees (30 to -30 degrees)
+        left_ranges  = msg.ranges[31:90] # 31 to 90 degrees (31 to 90 degrees)
+        back_ranges  = msg.ranges[91:270] # 91 to 270 degrees (91 to -90 degrees)
+        right_ranges = msg.ranges[271:330] # 271 to 330 degrees (-30 to -91 degrees)
+
+        # Store True/False values for each sensor segment, based on whether the nearest detected obstacle is closer than SCAN_THRESHOLD
+        self.scan_triggered[SCAN_FRONT] = min(front_ranges) < SCAN_THRESHOLD 
+        self.scan_triggered[SCAN_LEFT]  = min(left_ranges)  < SCAN_THRESHOLD
+        self.scan_triggered[SCAN_BACK]  = min(back_ranges)  < SCAN_THRESHOLD
         self.scan_triggered[SCAN_RIGHT] = min(right_ranges) < SCAN_THRESHOLD
 
 
@@ -278,7 +351,7 @@ class RobotController(Node):
                     rqt.robot_id = self.robot_id
                     try:
                         future = self.pick_up_service.call_async(rqt)
-                        self.executor.spin_until_future_complete(future)
+                        rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Successfully picked up item!')
@@ -309,28 +382,19 @@ class RobotController(Node):
                     dy = target_pos['y'] - self.pose.position.y
                     distance = math.sqrt(dx*dx + dy*dy)
                     
-                    self.get_logger().info(f'Navigating to {target} zone, distance: {distance:.2f}m')
-                    
-                    if distance < 0.5:
+                    if distance < 0.5:  # Close enough to offload
                         self.state = State.OFFLOADING
                         return
                         
-                    msg = Twist()
+                    # Navigate towards zone
                     angle_to_target = math.atan2(dy, dx)
                     angle_diff = angles.normalize_angle(angle_to_target - self.yaw)
                     
-                    if abs(angle_diff) > 0.1:
-                        msg.angular.z = max(-0.3, min(0.3, angle_diff))
-                    else:
-                        msg.linear.x = max(0.1, min(0.3, 0.2 * distance))
-                        msg.angular.z = 0.1 * angle_diff
-                    
-                    self.cmd_vel_publisher.publish(msg)
-                else:
-                    # Explore to find zones
                     msg = Twist()
-                    msg.linear.x = LINEAR_VELOCITY
-                    msg.angular.z = TURN_LEFT * ANGULAR_VELOCITY * 0.2
+                    if abs(angle_diff) > 0.1:
+                        msg.angular.z = 0.3 * angle_diff
+                    else:
+                        msg.linear.x = 0.2
                     self.cmd_vel_publisher.publish(msg)
 
             case State.OFFLOADING:
@@ -345,7 +409,7 @@ class RobotController(Node):
                 rqt.robot_id = self.robot_id
                 try:
                     future = self.offload_service.call_async(rqt)
-                    self.executor.spin_until_future_complete(future)
+                    rclpy.spin_until_future_complete(self, future)
                     response = future.result()
                     if response.success:
                         self.get_logger().info('Successfully offloaded item!')
@@ -369,43 +433,51 @@ class RobotController(Node):
         super().destroy_node()
 
     def zone_callback(self, msg):
+        self.get_logger().info('Received zone update')
         for zone in msg.data:
             if zone.colour in self.zones:
-                self.zones[zone.colour]['assigned_color'] = zone.assigned_colour
+                # Store the zone's current color assignment if it has one
+                self.zones[zone.colour]['assigned_color'] = zone.assigned_colour if zone.assigned_colour else None
+                self.get_logger().info(f'Zone {zone.colour} status - Assigned color: {zone.assigned_colour}')
 
     def get_nearest_zone(self):
+        # Find closest compatible zone for current item
         min_dist = float('inf')
         nearest = None
         
         for color, pos in self.zones.items():
-            # Skip if zone is assigned to different color
-            if pos.get('assigned_color') and pos['assigned_color'] != self.item_color:
-                continue
-            
             dx = pos['x'] - self.pose.position.x
             dy = pos['y'] - self.pose.position.y
             dist = math.sqrt(dx*dx + dy*dy)
+            
+            # Log zone distances for debugging
+            self.get_logger().info(f'Zone {color}: distance = {dist:.2f}m')
             
             if dist < min_dist:
                 min_dist = dist
                 nearest = color
         
+        if nearest:
+            self.get_logger().info(f'Selected zone {nearest} at distance {min_dist:.2f}m')
+        else:
+            self.get_logger().info('No suitable zone found')
+        
         return nearest
 
 def main(args=None):
-    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    rclpy.init(args=args)
     
     try:
-        node = RobotController()
-        try:
-            rclpy.spin(node)
-        except KeyboardInterrupt:
-            pass
-        node.destroy_node()
-    except ExternalShutdownException:
-        sys.exit(1)
+        robot_controller = RobotController()
+        rclpy.spin(robot_controller)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f'Error occurred: {str(e)}')
     finally:
-        rclpy.try_shutdown()
+        if 'robot_controller' in locals():
+            robot_controller.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
