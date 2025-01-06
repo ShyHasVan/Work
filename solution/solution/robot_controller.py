@@ -81,6 +81,8 @@ class RobotController(Node):
         
         # Publishers and subscribers
         self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.marker_publisher = self.create_publisher(StringWithPose, '/marker_input', 10)
+        
         self.odom_subscriber = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
         self.scan_subscriber = self.create_subscription(LaserScan, '/scan', self.scan_callback, QoSPresetProfiles.SENSOR_DATA.value)
         self.item_subscriber = self.create_subscription(ItemList, '/items', self.item_callback, 10)
@@ -89,6 +91,9 @@ class RobotController(Node):
         # Services
         self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item')
         self.offload_service = self.create_client(ItemRequest, '/offload_item')
+        
+        # Timer for control loop
+        self.timer = self.create_timer(0.1, self.control_loop)
         
         # Simple zone positions
         self.zones = {
@@ -390,21 +395,17 @@ class RobotController(Node):
 def main(args=None):
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     
-    node = RobotController()
-    executor = MultiThreadedExecutor()
-    node.executor = executor  # Store executor reference
-    executor.add_node(node)
-    
     try:
-        executor.spin()
-    except KeyboardInterrupt:
-        pass
+        node = RobotController()
+        try:
+            rclpy.spin(node)
+        except KeyboardInterrupt:
+            pass
+        node.destroy_node()
     except ExternalShutdownException:
         sys.exit(1)
     finally:
-        node.destroy_node()
         rclpy.try_shutdown()
-        
-        
+
 if __name__ == '__main__':
     main()
