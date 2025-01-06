@@ -66,9 +66,6 @@ class RobotController(Node):
         # Add initialization check
         self.get_logger().info('Initializing robot controller...')
         
-        # Add executor as class variable
-        self.executor = MultiThreadedExecutor()
-        
         # Class variables used to store persistent values between executions of callbacks and control loop
         self.state = State.FORWARD # Current FSM state
         self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
@@ -353,7 +350,7 @@ class RobotController(Node):
                     rqt.robot_id = self.robot_id
                     try:
                         future = self.pick_up_service.call_async(rqt)
-                        self.executor.spin_until_future_complete(future)
+                        rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Successfully picked up item!')
@@ -411,7 +408,7 @@ class RobotController(Node):
                 rqt.robot_id = self.robot_id
                 try:
                     future = self.offload_service.call_async(rqt)
-                    self.executor.spin_until_future_complete(future)
+                    rclpy.spin_until_future_complete(self, future)
                     response = future.result()
                     if response.success:
                         self.get_logger().info('Successfully offloaded item!')
@@ -467,24 +464,19 @@ class RobotController(Node):
         return nearest
 
 def main(args=None):
-
-    rclpy.init(args = args, signal_handler_options = SignalHandlerOptions.NO)
-
-    node = RobotController()
-
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
-
+    rclpy.init(args=args)
+    
     try:
-        executor.spin()
+        robot_controller = RobotController()
+        rclpy.spin(robot_controller)
     except KeyboardInterrupt:
         pass
-    except ExternalShutdownException:
-        sys.exit(1)
+    except Exception as e:
+        print(f'Error occurred: {str(e)}')
     finally:
-        node.destroy_node()
-        rclpy.try_shutdown()
-
+        if 'robot_controller' in locals():
+            robot_controller.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
