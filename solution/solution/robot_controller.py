@@ -68,11 +68,18 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Add initialization check
-        self.get_logger().info('Initializing robot controller...')
+        # Basic initialization first
+        self.pose = Pose()
+        self.previous_pose = Pose()
+        self.state = State.FORWARD
         
-        # Initialize Nav2
+        # Create publishers and basic services first
+        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+        
+        # Initialize Nav2 after basic setup
         self.navigator = BasicNavigator()
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         
         # Set initial pose for Nav2
         initial_pose = PoseStamped()
@@ -80,24 +87,13 @@ class RobotController(Node):
         initial_pose.header.stamp = self.get_clock().now().to_msg()
         initial_pose.pose = self.pose
         
-        self.navigator.setInitialPose(initial_pose)
-        
-        # Wait for Nav2 to be ready with timeout
         try:
+            self.navigator.setInitialPose(initial_pose)
             self.navigator.waitUntilNav2Active(timeout_sec=10.0)
         except Exception as e:
-            self.get_logger().error(f'Failed to initialize Nav2: {str(e)}')
-            rclpy.shutdown()
-            return
-
-        # Create transform listener after Nav2 is ready
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+            self.get_logger().warn(f'Nav2 initialization failed: {str(e)}. Continuing with basic navigation.')
         
         # Class variables used to store persistent values between executions of callbacks and control loop
-        self.state = State.FORWARD # Current FSM state
-        self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
-        self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
         self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
         self.previous_yaw = 0.0 # Snapshot of the angle for comparison against future angles
         self.turn_angle = 0.0 # Relative angle to turn to in the TURNING state
@@ -173,17 +169,6 @@ class RobotController(Node):
         # 
         # Gazebo ROS differential drive plugin subscribes to these messages, and converts them into left and right wheel speeds
         # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L537-L555
-        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
-
-        #self.orientation_publisher = self.create_publisher(Float32, '/orientation', 10)
-
-        # Publishes custom StringWithPose (see auro_interfaces/msg/StringWithPose.msg) messages on the /marker_input topic
-        # The week3/rviz_text_marker node subscribes to these messages, and ouputs a Marker message on the /marker_output topic
-        # ros2 run week_3 rviz_text_marker
-        # This can be visualised in RViz: Add > By topic > /marker_output
-        #
-        # http://docs.ros.org/en/noetic/api/visualization_msgs/html/msg/Marker.html
-        # http://wiki.ros.org/rviz/DisplayTypes/Marker
         self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10, callback_group=timer_callback_group)
 
         # Creates a timer that calls the control_loop method repeatedly - each loop represents single iteration of the FSM
@@ -311,15 +296,11 @@ class RobotController(Node):
                     self.state = State.FORWARD
                     return
                 
-                closest_item = max(self.items.data, key=lambda x: x.diameter)
+                closest_item = self.items.data[0]
                 estimated_distance = 32.4 * float(closest_item.diameter) ** -0.75
-                
-                if estimated_distance < 0.35:
-                    msg = Twist()
-                    msg.linear.x = 0.0
-                    msg.angular.z = 0.0
-                    self.cmd_vel_publisher.publish(msg)
-                    
+
+                if estimated_distance <= 0.35:
+                    # Pickup logic remains the same
                     rqt = ItemRequest.Request()
                     rqt.robot_id = self.robot_id
                     try:
@@ -327,20 +308,14 @@ class RobotController(Node):
                         rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
-                            self.get_logger().info('Successfully picked up item!')
                             self.holding_item = True
                             self.item_color = closest_item.colour
-                            self.previous_pose = self.pose
-                            self.goal_distance = random.uniform(1.0, 2.0)
                             self.state = State.OFFLOADING
-                            self.get_logger().info(f'Transitioning to OFFLOADING state')
                             return
-                        else:
-                            self.get_logger().info('Failed to pick up item: ' + response.message)
                     except Exception as e:
                         self.get_logger().info(f'Service call failed: {str(e)}')
                 
-                # Only move if we haven't picked up the item
+                # Basic movement for collection
                 msg = Twist()
                 msg.linear.x = max(0.1, min(0.3, 0.25 * estimated_distance))
                 msg.angular.z = max(-0.5, min(0.5, closest_item.x / 320.0))
@@ -352,23 +327,35 @@ class RobotController(Node):
                     return
 
                 target, distance = self.get_nearest_zone()
-                if target:
+                if not target:
+                    # No compatible zone found, do random walk
+                    msg = Twist()
+                    msg.linear.x = 0.2
+                    self.cmd_vel_publisher.publish(msg)
+                    return
+
+                try:
+                    # Try Nav2 for zone navigation
                     target_pos = self.zones[target]
-                    if self.navigate_to_pose(target_pos['x'], target_pos['y']):
-                        # Try to offload
+                    success = self.navigate_to_pose(target_pos['x'], target_pos['y'])
+                    
+                    if success and distance < 0.5:
                         rqt = ItemRequest.Request()
                         rqt.robot_id = self.robot_id
-                        try:
-                            future = self.offload_service.call_async(rqt)
-                            rclpy.spin_until_future_complete(self, future)
-                            response = future.result()
-                            if response.success:
-                                self.holding_item = False
-                                self.item_color = None
-                                self.state = State.FORWARD
-                else:
-                    # No compatible zone, explore using Nav2's built-in exploration
-                    self.navigator.explorationTask()
+                        future = self.offload_service.call_async(rqt)
+                        rclpy.spin_until_future_complete(self, future)
+                        response = future.result()
+                        if response.success:
+                            self.holding_item = False
+                            self.item_color = None
+                            self.state = State.FORWARD
+                except Exception as e:
+                    # Fallback to basic movement if Nav2 fails
+                    self.get_logger().warn(f'Nav2 failed: {str(e)}. Using basic movement.')
+                    msg = Twist()
+                    msg.linear.x = 0.2
+                    msg.angular.z = 0.1
+                    self.cmd_vel_publisher.publish(msg)
 
             case _:
                 pass
