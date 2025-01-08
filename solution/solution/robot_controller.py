@@ -288,13 +288,9 @@ class RobotController(Node):
                 closest_item = max(self.items.data, key=lambda x: x.diameter)
                 msg = Twist()
 
-                angle_to_item = closest_item.x / 320.0  # Convert pixel x to normalized angle
+                angle_to_item = closest_item.x / 320.0
                 estimated_distance = 32.4 * float(closest_item.diameter) ** -0.75
                 
-                self.get_logger().info(f'Approaching item - Distance: {estimated_distance:.2f}m, ' +
-                                      f'Angle: {math.degrees(angle_to_item):.2f}°, ' +
-                                      f'Color: {closest_item.colour}')
-
                 if estimated_distance < 0.35:
                     msg.linear.x = 0.0
                     msg.angular.z = 0.0
@@ -311,14 +307,14 @@ class RobotController(Node):
                             self.holding_item = True
                             self.item_color = closest_item.colour
                             self.state = State.DEPOSITING
+                            # Start with random movement to find zones
+                            self.goal_distance = random.uniform(1.0, 2.0)
+                            self.previous_pose = self.pose
                         else:
                             self.get_logger().info('Failed to pick up item: ' + response.message)
-                            msg.linear.x = 0.05
-                            self.cmd_vel_publisher.publish(msg)
                     except Exception as e:
                         self.get_logger().info(f'Service call failed: {str(e)}')
                 else:
-                    # Adjust approach speeds for smoother motion
                     msg.linear.x = max(0.1, min(0.3, 0.25 * estimated_distance))
                     msg.angular.z = max(-0.5, min(0.5, angle_to_item))
                     self.cmd_vel_publisher.publish(msg)
@@ -327,27 +323,40 @@ class RobotController(Node):
                 if not self.holding_item:
                     self.state = State.FORWARD
                     return
-                    
+
+                # First, try to find a compatible zone
                 target, distance = self.get_nearest_zone()
+                
                 if not target:
-                    # No compatible zone found, try a different direction
-                    self.state = State.TURNING
-                    self.turn_angle = random.uniform(90, 180)
-                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    # No compatible zone found, do random walk
+                    difference_x = self.pose.position.x - self.previous_pose.position.x
+                    difference_y = self.pose.position.y - self.previous_pose.position.y
+                    distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
+
+                    msg = Twist()
+                    if distance_travelled >= self.goal_distance:
+                        # Change direction randomly
+                        self.previous_yaw = self.yaw
+                        self.turn_angle = random.uniform(45, 180)
+                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                        msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
+                        if math.fabs(angles.normalize_angle(self.yaw - self.previous_yaw)) >= math.radians(self.turn_angle):
+                            self.previous_pose = self.pose
+                            self.goal_distance = random.uniform(1.0, 2.0)
+                    else:
+                        msg.linear.x = LINEAR_VELOCITY
+                    self.cmd_vel_publisher.publish(msg)
                     return
-                    
+
+                # We found a compatible zone, navigate to it
                 target_pos = self.zones[target]
                 dx = target_pos['x'] - self.pose.position.x
                 dy = target_pos['y'] - self.pose.position.y
-                
-                # Calculate angle to target
                 angle_to_target = math.atan2(dy, dx)
                 angle_diff = angles.normalize_angle(angle_to_target - self.yaw)
                 
                 msg = Twist()
-                
-                # If we're close enough to offload
-                if distance < 0.5:
+                if distance < 0.5:  # Close enough to offload
                     msg.linear.x = 0.0
                     msg.angular.z = 0.0
                     self.cmd_vel_publisher.publish(msg)
@@ -365,21 +374,19 @@ class RobotController(Node):
                             self.state = State.FORWARD
                         else:
                             self.get_logger().info('Failed to offload item: ' + response.message)
-                            # Back up and try again
-                            msg.linear.x = -0.1
-                            self.cmd_vel_publisher.publish(msg)
+                            # Back up and try a different approach
+                            self.previous_pose = self.pose
+                            self.goal_distance = random.uniform(0.5, 1.0)
                     except Exception as e:
                         self.get_logger().info(f'Service call failed: {str(e)}')
                 else:
-                    # Two-phase movement: first align, then move
+                    # Two-phase movement with smoother transitions
                     if abs(angle_diff) > 0.1:
-                        # Align with target
                         msg.angular.z = max(-0.5, min(0.5, angle_diff))
                         self.get_logger().info(f'Aligning with zone, angle diff: {math.degrees(angle_diff):.2f}°')
                     else:
-                        # Move towards target with small angular corrections
                         msg.linear.x = max(0.1, min(0.3, 0.2 * distance))
-                        msg.angular.z = 0.1 * angle_diff
+                        msg.angular.z = 0.1 * angle_diff  # Small correction while moving
                         self.get_logger().info(f'Moving to zone, distance: {distance:.2f}m, speed: {msg.linear.x:.2f}m/s')
                     
                     self.cmd_vel_publisher.publish(msg)
