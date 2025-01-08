@@ -335,50 +335,51 @@ class RobotController(Node):
                     distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
 
                     if distance_travelled >= self.goal_distance:
+                        self.state = State.TURNING
                         self.previous_yaw = self.yaw
                         self.turn_angle = random.uniform(30, 150)
                         self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                        self.state = State.TURNING
-                else:
-                    # We found a compatible zone
-                    target_pos = self.zones[target]
-                    dx = target_pos['x'] - self.pose.position.x
-                    dy = target_pos['y'] - self.pose.position.y
-                    angle_to_target = math.atan2(dy, dx)
-                    angle_diff = angles.normalize_angle(angle_to_target - self.yaw)
+                        self.previous_pose = self.pose  # Update previous pose before turning
+                    return  # Important: return here to ensure the state change takes effect
+
+                # We found a compatible zone
+                target_pos = self.zones[target]
+                dx = target_pos['x'] - self.pose.position.x
+                dy = target_pos['y'] - self.pose.position.y
+                angle_to_target = math.atan2(dy, dx)
+                angle_diff = angles.normalize_angle(angle_to_target - self.yaw)
+                
+                msg = Twist()
+                if distance < 0.5:  # Close enough to offload
+                    msg.linear.x = 0.0
+                    msg.angular.z = 0.0
+                    self.cmd_vel_publisher.publish(msg)
                     
-                    msg = Twist()
-                    if distance < 0.5:  # Close enough to offload
-                        msg.linear.x = 0.0
-                        msg.angular.z = 0.0
-                        self.cmd_vel_publisher.publish(msg)
-                        
-                        rqt = ItemRequest.Request()
-                        rqt.robot_id = self.robot_id
-                        try:
-                            future = self.offload_service.call_async(rqt)
-                            rclpy.spin_until_future_complete(self, future)
-                            response = future.result()
-                            if response.success:
-                                self.holding_item = False
-                                self.item_color = None
-                                self.state = State.FORWARD
-                                self.previous_pose = self.pose
-                                self.goal_distance = random.uniform(1.0, 2.0)
-                            else:
-                                # Back up and try again
-                                msg.linear.x = -0.1
-                                self.cmd_vel_publisher.publish(msg)
-                        except Exception as e:
-                            self.get_logger().info(f'Service call failed: {str(e)}')
-                    else:
-                        # Two-phase movement: align then move
-                        if abs(angle_diff) > 0.1:
-                            msg.angular.z = max(-0.5, min(0.5, angle_diff))
+                    rqt = ItemRequest.Request()
+                    rqt.robot_id = self.robot_id
+                    try:
+                        future = self.offload_service.call_async(rqt)
+                        rclpy.spin_until_future_complete(self, future)
+                        response = future.result()
+                        if response.success:
+                            self.holding_item = False
+                            self.item_color = None
+                            self.state = State.FORWARD
+                            self.previous_pose = self.pose
+                            self.goal_distance = random.uniform(1.0, 2.0)
                         else:
-                            msg.linear.x = max(0.1, min(0.3, 0.2 * distance))
-                            msg.angular.z = 0.1 * angle_diff  # Small correction while moving
-                        self.cmd_vel_publisher.publish(msg)
+                            msg.linear.x = -0.1
+                            self.cmd_vel_publisher.publish(msg)
+                    except Exception as e:
+                        self.get_logger().info(f'Service call failed: {str(e)}')
+                else:
+                    # Two-phase movement: align then move
+                    if abs(angle_diff) > 0.1:
+                        msg.angular.z = max(-0.5, min(0.5, angle_diff))
+                    else:
+                        msg.linear.x = max(0.1, min(0.3, 0.2 * distance))
+                        msg.angular.z = 0.1 * angle_diff
+                    self.cmd_vel_publisher.publish(msg)
 
             case _:
                 pass
