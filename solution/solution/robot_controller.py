@@ -274,6 +274,26 @@ class RobotController(Node):
                 return zone_name
         return None
 
+    def handle_obstacle_avoidance(self):
+        """Handle obstacle avoidance and return True if obstacle detected"""
+        if self.scan_triggered[SCAN_FRONT]:
+            self.get_logger().info('Front obstacle detected, making large turn')
+            self.previous_yaw = self.yaw
+            self.state = State.TURNING
+            self.turn_angle = random.uniform(150, 170)
+            self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+            return True
+        
+        if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
+            self.get_logger().info('Side obstacle detected, turning away')
+            self.previous_yaw = self.yaw
+            self.state = State.TURNING
+            self.turn_angle = random.uniform(45, 90)
+            self.turn_direction = TURN_RIGHT if self.scan_triggered[SCAN_LEFT] else TURN_LEFT
+            return True
+        
+        return False
+
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
         self.get_logger().info(f'State: {self.state.name}')
@@ -289,18 +309,9 @@ class RobotController(Node):
 
                 # Handle obstacle detection and movement
                 msg = Twist()
-                if self.scan_triggered[SCAN_FRONT] or self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
+                if self.scan_triggered[SCAN_FRONT]:
                     msg.linear.x = 0.0
                     self.cmd_vel_publisher.publish(msg)
-                    self.previous_yaw = self.yaw
-                    self.state = State.TURNING
-                    self.turn_angle = random.uniform(90, 120)
-                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                    return
-                
-                # More aggressive obstacle avoidance
-                if self.scan_triggered[SCAN_FRONT]:
-                    self.get_logger().info('Front obstacle detected, making large turn')
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
                     self.turn_angle = random.uniform(150, 170)  # Larger turn angle for front obstacles
@@ -308,16 +319,34 @@ class RobotController(Node):
                     return
                 
                 if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
-                    self.get_logger().info('Side obstacle detected, turning away')
+                    msg.linear.x = 0.0
+                    self.cmd_vel_publisher.publish(msg)
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
                     self.turn_angle = random.uniform(45, 90)
                     self.turn_direction = TURN_RIGHT if self.scan_triggered[SCAN_LEFT] else TURN_LEFT
                     return
-                
+
                 # Forward movement
                 msg.linear.x = LINEAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
+
+                # In FORWARD state
+                if self.handle_obstacle_avoidance():
+                    return
+
+                # In FORWARD state after obstacle check
+                difference_x = self.pose.position.x - self.previous_pose.position.x
+                difference_y = self.pose.position.y - self.previous_pose.position.y
+                distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
+
+                if distance_travelled >= self.goal_distance:
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = random.uniform(30, 150)
+                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    self.get_logger().info("Goal reached, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
+                    return
 
             case State.TURNING:
                 self.get_logger().info(f"Turning {self.turn_direction} by {self.turn_angle:.2f} degrees")
@@ -427,24 +456,26 @@ class RobotController(Node):
                         blocked_attempts += 1
                         if blocked_attempts >= len(ZONES):
                             self.get_logger().info('All zones blocked, offloading item in current location')
-                            # Rest of offloading code...
+                            request = ItemRequest.Request()
+                            request.robot_id = self.robot_id
+                            try:
+                                future = self.offload_service.call_async(request)
+                                rclpy.spin_until_future_complete(self, future)
+                                response = future.result()
+                                if response.success:
+                                    self.get_logger().info('Item offloaded in current location')
+                                    self.state = State.FORWARD
+                                else:
+                                    self.get_logger().error('Offload failed: ' + response.message)
+                                    self.state = State.FORWARD
+                            except Exception as e:
+                                self.get_logger().error(f'Offload failed: {str(e)}')
+                                self.state = State.FORWARD
+                            return
 
                 if target_zone:
                     # More aggressive obstacle avoidance
-                    if self.scan_triggered[SCAN_FRONT]:
-                        self.get_logger().info('Front obstacle detected, making large turn')
-                        self.previous_yaw = self.yaw
-                        self.state = State.TURNING
-                        self.turn_angle = random.uniform(150, 170)  # Larger turn angle for front obstacles
-                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                        return
-                    
-                    if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
-                        self.get_logger().info('Side obstacle detected, turning away')
-                        self.previous_yaw = self.yaw
-                        self.state = State.TURNING
-                        self.turn_angle = random.uniform(45, 90)
-                        self.turn_direction = TURN_RIGHT if self.scan_triggered[SCAN_LEFT] else TURN_LEFT
+                    if self.handle_obstacle_avoidance():
                         return
                     
                     if self.move_to_pose(ZONES[target_zone]['x'], ZONES[target_zone]['y']):
