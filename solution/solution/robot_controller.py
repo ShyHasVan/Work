@@ -1,3 +1,5 @@
+
+
 #
 # Copyright (c) 2024 University of York and others
 #
@@ -25,7 +27,7 @@ from std_msgs.msg import Float32
 from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from assessment_interfaces.msg import Item, ItemList, Zone, ZoneList
+from assessment_interfaces.msg import Item, ItemList
 from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
 
@@ -35,12 +37,6 @@ import angles
 from enum import Enum
 import random
 import math
-
-from nav2_simple_commander.robot_navigatorimport BasicNavigator
-from geometry_msgs.msg import PoseStamped
-from tf2_ros import TransformException
-from tf2_ros.buffer import Buffer
-from tf2_ros.transform_listener import TransformListener
 
 LINEAR_VELOCITY  = 0.3 # Metres per second
 ANGULAR_VELOCITY = 0.5 # Radians per second
@@ -60,7 +56,6 @@ class State(Enum):
     FORWARD = 0
     TURNING = 1
     COLLECTING = 2
-    OFFLOADING = 3  
 
 
 class RobotController(Node):
@@ -68,34 +63,10 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Basic initialization first
-        self.pose = Pose()
-        self.previous_pose = Pose()
-        self.state = State.FORWARD
-        
-        # Create publishers and basic services first
-        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
-        
-        # Initialize Nav2 after basic setup
-        self.navigator = BasicNavigator()
-        
-        # Wait for transform to be ready
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-        
-        # Set initial pose for Nav2 using odom frame
-        initial_pose = PoseStamped()
-        initial_pose.header.frame_id = 'odom'  # Changed from 'map' to 'odom'
-        initial_pose.header.stamp = self.get_clock().now().to_msg()
-        initial_pose.pose = self.pose
-        
-        try:
-            self.navigator.setInitialPose(initial_pose)
-            self.navigator.waitUntilNav2Active(timeout_sec=10.0)
-        except Exception as e:
-            self.get_logger().warn(f'Nav2 initialization failed: {str(e)}. Continuing with basic navigation.')
-        
         # Class variables used to store persistent values between executions of callbacks and control loop
+        self.state = State.FORWARD # Current FSM state
+        self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
+        self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
         self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
         self.previous_yaw = 0.0 # Snapshot of the angle for comparison against future angles
         self.turn_angle = 0.0 # Relative angle to turn to in the TURNING state
@@ -103,19 +74,6 @@ class RobotController(Node):
         self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
         self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
         self.items = ItemList()
-
-        # Add new variables for item handling
-        self.holding_item = False
-        self.item_color = None
-        self.target_zone = None
-        
-        # Define zones with their positions
-        self.zones = {
-            'cyan': {'x': -3.0, 'y': 3.0},      # Bottom left
-            'purple': {'x': 3.0, 'y': -3.0},    # Bottom right
-            'deeppink': {'x': 3.0, 'y': 3.0},   # Top right
-            'seagreen': {'x': -3.0, 'y': -3.0}  # Top left
-        }
 
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
@@ -171,24 +129,22 @@ class RobotController(Node):
         # 
         # Gazebo ROS differential drive plugin subscribes to these messages, and converts them into left and right wheel speeds
         # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L537-L555
+        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+
+        #self.orientation_publisher = self.create_publisher(Float32, '/orientation', 10)
+
+        # Publishes custom StringWithPose (see auro_interfaces/msg/StringWithPose.msg) messages on the /marker_input topic
+        # The week3/rviz_text_marker node subscribes to these messages, and ouputs a Marker message on the /marker_output topic
+        # ros2 run week_3 rviz_text_marker
+        # This can be visualised in RViz: Add > By topic > /marker_output
+        #
+        # http://docs.ros.org/en/noetic/api/visualization_msgs/html/msg/Marker.html
+        # http://wiki.ros.org/rviz/DisplayTypes/Marker
         self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10, callback_group=timer_callback_group)
 
         # Creates a timer that calls the control_loop method repeatedly - each loop represents single iteration of the FSM
         self.timer_period = 0.1 # 100 milliseconds = 10 Hz
         self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
-
-        # Subscribe to zone information
-        self.zone_subscriber = self.create_subscription(
-            ZoneList,
-            'zones',
-            self.zone_callback,
-            10,
-            callback_group=timer_callback_group
-        )
-
-        self.get_logger().info(f'Robot controller initialized with ID: {self.robot_id}')
-        self.get_logger().info(f'Initial position: ({self.pose.position.x:.2f}, {self.pose.position.y:.2f})')
-        self.get_logger().info(f'Initial state: {self.state}')
 
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
@@ -248,35 +204,75 @@ class RobotController(Node):
 
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
-        # Single clear state logging message
-        self.get_logger().info(f'STATE: {self.state.name} | Position: ({self.pose.position.x:.2f}, {self.pose.position.y:.2f}) | ' +
-                              f'Holding item: {self.holding_item} | Item color: {self.item_color if self.holding_item else "None"}')
+        # Add debug info about items near the start of control_loop
+        if len(self.items.data) > 0:
+            item = self.items.data[0]
+            self.get_logger().info(f'Current state: {self.state}, Items in view: {len(self.items.data)}, '
+                                 f'Nearest item at: ({item.x:.2f}, {item.y:.2f})')
+        elif self.state == State.COLLECTING:
+            self.get_logger().info('In COLLECTING state but no items visible!')
+
+        # Send message to rviz_text_marker node
+        marker_input = StringWithPose()
+        marker_input.text = str(self.state) # Visualise robot state as an RViz marker
+        marker_input.pose = self.pose # Set the pose of the RViz marker to track the robot's pose
+        self.marker_publisher.publish(marker_input)
+
+        #self.get_logger().info(f"{self.state}")
         
         match self.state:
+
             case State.FORWARD:
-                # Check if we see any items
+
+                if self.scan_triggered[SCAN_FRONT]:
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = random.uniform(150, 170)
+                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    self.get_logger().info("Detected obstacle in front, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
+                    return
+                
+                if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = 45
+
+                    if self.scan_triggered[SCAN_LEFT] and self.scan_triggered[SCAN_RIGHT]:
+                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                        self.get_logger().info("Detected obstacle to both the left and right, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
+                    elif self.scan_triggered[SCAN_LEFT]:
+                        self.turn_direction = TURN_RIGHT
+                        self.get_logger().info(f"Detected obstacle to the left, turning right by {self.turn_angle} degrees")
+                    else: # self.scan_triggered[SCAN_RIGHT]
+                        self.turn_direction = TURN_LEFT
+                        self.get_logger().info(f"Detected obstacle to the right, turning left by {self.turn_angle} degrees")
+                    return
+                
                 if len(self.items.data) > 0:
                     self.state = State.COLLECTING
                     return
 
-                # Move forward
                 msg = Twist()
                 msg.linear.x = LINEAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
 
-                # Calculate distance traveled
                 difference_x = self.pose.position.x - self.previous_pose.position.x
                 difference_y = self.pose.position.y - self.previous_pose.position.y
                 distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
+
+                # self.get_logger().info(f"Driven {distance_travelled:.2f} out of {self.goal_distance:.2f} metres")
 
                 if distance_travelled >= self.goal_distance:
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
                     self.turn_angle = random.uniform(30, 150)
                     self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                    self.get_logger().info(f"Goal reached, turning {'left' if self.turn_direction == TURN_LEFT else 'right'} by {self.turn_angle:.2f} degrees")
+                    self.get_logger().info("Goal reached, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
 
             case State.TURNING:
+
+                self.get_logger().info("Turning state")
+
                 if len(self.items.data) > 0:
                     self.state = State.COLLECTING
                     return
@@ -285,7 +281,9 @@ class RobotController(Node):
                 msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
 
-                yaw_difference = angles.normalize_angle(self.yaw - self.previous_yaw)
+                # self.get_logger().info(f"Turned {math.degrees(math.fabs(yaw_difference)):.2f} out of {self.turn_angle:.2f} degrees")
+
+                yaw_difference = angles.normalize_angle(self.yaw - self.previous_yaw)                
 
                 if math.fabs(yaw_difference) >= math.radians(self.turn_angle):
                     self.previous_pose = self.pose
@@ -295,14 +293,27 @@ class RobotController(Node):
 
             case State.COLLECTING:
                 if len(self.items.data) == 0:
+                    self.previous_pose = self.pose
+                    self.goal_distance = random.uniform(1.0, 2.0)
                     self.state = State.FORWARD
                     return
                 
-                closest_item = self.items.data[0]
-                estimated_distance = 32.4 * float(closest_item.diameter) ** -0.75
+                # Choose the closest item based on diameter (larger diameter = closer)
+                closest_item = max(self.items.data, key=lambda x: x.diameter)
+                msg = Twist()
 
-                if estimated_distance <= 0.35:
-                    # Pickup logic remains the same
+                # x is left/right in camera view (negative is right)
+                # y is up/down in camera view (negative is down)
+                angle_to_item = closest_item.x / 320.0  # Convert pixel x to normalized angle
+                estimated_distance = 32.4 * float(closest_item.diameter) ** -0.75
+                
+                self.get_logger().info(f'Item detected - Distance: {estimated_distance:.2f}m, Angle: {math.degrees(angle_to_item):.2f}°')
+
+                if estimated_distance < 0.35:  # DISTANCE from item_manager.py
+                    msg.linear.x = 0.0
+                    msg.angular.z = 0.0
+                    self.cmd_vel_publisher.publish(msg)
+                    
                     rqt = ItemRequest.Request()
                     rqt.robot_id = self.robot_id
                     try:
@@ -310,66 +321,20 @@ class RobotController(Node):
                         rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
-                            self.holding_item = True
-                            self.item_color = closest_item.colour
-                            self.state = State.OFFLOADING
-                            return
-                    except Exception as e:
-                        self.get_logger().info(f'Service call failed: {str(e)}')
-                
-                # Basic movement for collection
-                msg = Twist()
-                msg.linear.x = max(0.1, min(0.3, 0.25 * estimated_distance))
-                msg.angular.z = max(-0.5, min(0.5, closest_item.x / 320.0))
-                self.cmd_vel_publisher.publish(msg)
-
-            case State.OFFLOADING:
-                if not self.holding_item:
-                    self.state = State.FORWARD
-                    return
-
-                target, distance = self.get_nearest_zone()
-                
-                if not target:
-                    # No compatible zone found, do random walk (from week 5)
-                    msg = Twist()
-                    msg.linear.x = LINEAR_VELOCITY
-                    self.cmd_vel_publisher.publish(msg)
-
-                    difference_x = self.pose.position.x - self.previous_pose.position.x
-                    difference_y = self.pose.position.y - self.previous_pose.position.y
-                    distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
-
-                    if distance_travelled >= self.goal_distance:
-                        self.state = State.TURNING
-                        self.previous_yaw = self.yaw
-                        self.turn_angle = random.uniform(30, 150)
-                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                        self.previous_pose = self.pose
-                    return
-
-                # We found a compatible zone - use week 8's approach
-                target_pos = self.zones[target]
-                if distance < 0.5:  # Close enough to try offloading
-                    rqt = ItemRequest.Request()
-                    rqt.robot_id = self.robot_id
-                    try:
-                        future = self.offload_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
-                        response = future.result()
-                        if response.success:
-                            self.holding_item = False
-                            self.item_color = None
+                            self.get_logger().info('Successfully picked up item!')
                             self.state = State.FORWARD
-                            self.previous_pose = self.pose
-                            self.goal_distance = random.uniform(1.0, 2.0)
+                        else:
+                            self.get_logger().info('Failed to pick up item: ' + response.message)
+                            # Move slightly closer if pickup failed
+                            msg.linear.x = 0.05
+                            self.cmd_vel_publisher.publish(msg)
                     except Exception as e:
                         self.get_logger().info(f'Service call failed: {str(e)}')
                 else:
-                    # Move towards zone using week 8's movement approach
-                    msg = self.move_to_zone(target_pos, distance)
+                    # Use proportional control for smoother approach
+                    msg.linear.x = 0.25 * estimated_distance  # Proportional to distance
+                    msg.angular.z = angle_to_item  # Proportional to angle offset
                     self.cmd_vel_publisher.publish(msg)
-
             case _:
                 pass
         
@@ -379,95 +344,26 @@ class RobotController(Node):
         self.get_logger().info(f"Stopping: {msg}")
         super().destroy_node()
 
-    def zone_callback(self, msg):
-        self.get_logger().info('Received zone update')
-        for zone in msg.data:
-            if zone.colour in self.zones:
-                # Store the zone's current color assignment if it has one
-                self.zones[zone.colour]['assigned_color'] = zone.assigned_colour if zone.assigned_colour else None
-                self.get_logger().info(f'Zone {zone.colour} - Position: ({self.zones[zone.colour]["x"]}, {self.zones[zone.colour]["y"]}), Assigned color: {zone.assigned_colour}')
-
-    def get_nearest_zone(self):
-        min_dist = float('inf')
-        nearest = None
-        
-        for color, pos in self.zones.items():
-            # Check if zone is compatible with our item
-            assigned_color = pos.get('assigned_color')
-            
-            if assigned_color is not None and assigned_color != self.item_color:
-                continue
-            
-            dx = pos['x'] - self.pose.position.x
-            dy = pos['y'] - self.pose.position.y
-            dist = math.sqrt(dx*dx + dy*dy)
-            
-            if dist < min_dist:
-                min_dist = dist
-                nearest = color
-        
-        return nearest, min_dist
-
-    def move_to_zone(self, target_pos, distance):
-        msg = Twist()
-        
-        # Calculate angle to target (like week 8's RETURNING state)
-        angle_to_target = math.atan2(
-            target_pos['y'] - self.pose.position.y,
-            target_pos['x'] - self.pose.position.x
-        )
-        angle_diff = angles.normalize_angle(angle_to_target - self.yaw)
-        
-        # Use week 8's scaling approach
-        scale_rotation_rate = 0.5
-        msg.angular.z = scale_rotation_rate * angle_diff
-        
-        scale_forward_speed = 0.25
-        msg.linear.x = scale_forward_speed * distance
-        
-        return msg
-
-    def navigate_to_pose(self, x, y):
-        try:
-            goal_pose = PoseStamped()
-            goal_pose.header.frame_id = 'odom'  # Changed from 'map' to 'odom'
-            goal_pose.header.stamp = self.get_clock().now().to_msg()
-            goal_pose.pose.position.x = x
-            goal_pose.pose.position.y = y
-            goal_pose.pose.orientation.w = 1.0
-            
-            # Set a shorter timeout for navigation
-            self.navigator.goToPose(goal_pose)
-            
-            timeout_count = 0
-            while not self.navigator.isTaskComplete():
-                feedback = self.navigator.getFeedback()
-                timeout_count += 1
-                if timeout_count > 50:  # Shorter timeout
-                    self.navigator.cancelTask()
-                    return False
-                self.get_logger().info('Navigating to goal...')
-                
-            return self.navigator.isTaskComplete()
-            
-        except Exception as e:
-            self.get_logger().error(f'Navigation error: {str(e)}')
-            return False
 
 def main(args=None):
-    rclpy.init(args=args)
-    
+
+    rclpy.init(args = args, signal_handler_options = SignalHandlerOptions.NO)
+
+    node = RobotController()
+
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+
     try:
-        robot_controller = RobotController()
-        rclpy.spin(robot_controller)
+        executor.spin()
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        print(f'Error occurred: {str(e)}')
+    except ExternalShutdownException:
+        sys.exit(1)
     finally:
-        if 'robot_controller' in locals():
-            robot_controller.destroy_node()
-        rclpy.shutdown()
+        node.destroy_node()
+        rclpy.try_shutdown()
+
 
 if __name__ == '__main__':
     main()
