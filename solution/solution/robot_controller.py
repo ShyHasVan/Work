@@ -54,8 +54,7 @@ class State(Enum):
     FORWARD = 0
     TURNING = 1
     COLLECTING = 2
-    NAVIGATING_TO_ZONE = 3
-    OFFLOADING = 4
+    DEPOSITING = 3  # Combined state for navigation and offloading
 
 
 class RobotController(Node):
@@ -238,6 +237,46 @@ class RobotController(Node):
                               f'Yaw: {math.degrees(self.yaw):.2f}°, Items visible: {len(self.items.data)}')
         
         match self.state:
+            case State.FORWARD:
+                # Check if we see any items
+                if len(self.items.data) > 0:
+                    self.state = State.COLLECTING
+                    return
+
+                # Move forward
+                msg = Twist()
+                msg.linear.x = LINEAR_VELOCITY
+                self.cmd_vel_publisher.publish(msg)
+
+                # Calculate distance traveled
+                difference_x = self.pose.position.x - self.previous_pose.position.x
+                difference_y = self.pose.position.y - self.previous_pose.position.y
+                distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
+
+                if distance_travelled >= self.goal_distance:
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = random.uniform(30, 150)
+                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    self.get_logger().info(f"Goal reached, turning {'left' if self.turn_direction == TURN_LEFT else 'right'} by {self.turn_angle:.2f} degrees")
+
+            case State.TURNING:
+                if len(self.items.data) > 0:
+                    self.state = State.COLLECTING
+                    return
+
+                msg = Twist()
+                msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
+                self.cmd_vel_publisher.publish(msg)
+
+                yaw_difference = angles.normalize_angle(self.yaw - self.previous_yaw)
+
+                if math.fabs(yaw_difference) >= math.radians(self.turn_angle):
+                    self.previous_pose = self.pose
+                    self.goal_distance = random.uniform(1.0, 2.0)
+                    self.state = State.FORWARD
+                    self.get_logger().info(f"Finished turning, driving forward by {self.goal_distance:.2f} metres")
+
             case State.COLLECTING:
                 if len(self.items.data) == 0:
                     self.get_logger().info('Lost sight of item, returning to FORWARD state')
@@ -246,7 +285,6 @@ class RobotController(Node):
                     self.state = State.FORWARD
                     return
                 
-                # Choose the closest item based on diameter
                 closest_item = max(self.items.data, key=lambda x: x.diameter)
                 msg = Twist()
 
@@ -272,7 +310,7 @@ class RobotController(Node):
                             self.get_logger().info('Successfully picked up item!')
                             self.holding_item = True
                             self.item_color = closest_item.colour
-                            self.state = State.NAVIGATING_TO_ZONE
+                            self.state = State.DEPOSITING
                         else:
                             self.get_logger().info('Failed to pick up item: ' + response.message)
                             msg.linear.x = 0.05
@@ -285,25 +323,48 @@ class RobotController(Node):
                     msg.angular.z = max(-0.5, min(0.5, angle_to_item))
                     self.cmd_vel_publisher.publish(msg)
 
-            case State.NAVIGATING_TO_ZONE:
+            case State.DEPOSITING:
                 if not self.holding_item:
                     self.state = State.FORWARD
                     return
                     
                 target = self.get_nearest_zone()
-                if target:
-                    target_pos = self.zones[target]
-                    dx = target_pos['x'] - self.pose.position.x
-                    dy = target_pos['y'] - self.pose.position.y
-                    distance = math.sqrt(dx*dx + dy*dy)
+                if not target:
+                    # No compatible zone found, keep searching
+                    self.state = State.FORWARD
+                    return
                     
-                    self.get_logger().info(f'Navigating to {target} zone at ({target_pos["x"]}, {target_pos["y"]}), ' +
-                                          f'distance: {distance:.2f}m')
+                target_pos = self.zones[target]
+                dx = target_pos['x'] - self.pose.position.x
+                dy = target_pos['y'] - self.pose.position.y
+                distance = math.sqrt(dx*dx + dy*dy)
+                
+                self.get_logger().info(f'Navigating to {target} zone at ({target_pos["x"]}, {target_pos["y"]}), ' +
+                                      f'distance: {distance:.2f}m')
+                
+                if distance < 0.5:  # Close enough to offload
+                    msg = Twist()
+                    self.cmd_vel_publisher.publish(msg)
                     
-                    if distance < 0.5:  # Close enough to offload
-                        self.state = State.OFFLOADING
-                        return
-                        
+                    rqt = ItemRequest.Request()
+                    rqt.robot_id = self.robot_id
+                    try:
+                        future = self.offload_service.call_async(rqt)
+                        rclpy.spin_until_future_complete(self, future)
+                        response = future.result()
+                        if response.success:
+                            self.get_logger().info('Successfully offloaded item!')
+                            self.holding_item = False
+                            self.item_color = None
+                            self.state = State.FORWARD
+                        else:
+                            self.get_logger().info('Failed to offload item: ' + response.message)
+                            # Move slightly and try again
+                            msg.linear.x = -0.1
+                            self.cmd_vel_publisher.publish(msg)
+                    except Exception as e:
+                        self.get_logger().info(f'Service call failed: {str(e)}')
+                else:
                     # Navigate towards zone
                     angle_to_target = math.atan2(dy, dx)
                     angle_diff = angles.normalize_angle(angle_to_target - self.yaw)
@@ -315,32 +376,6 @@ class RobotController(Node):
                         msg.linear.x = max(0.1, min(0.3, 0.2 * distance))
                         msg.angular.z = 0.1 * angle_diff  # Small correction while moving
                     self.cmd_vel_publisher.publish(msg)
-
-            case State.OFFLOADING:
-                if not self.holding_item:
-                    self.state = State.FORWARD
-                    return
-                    
-                msg = Twist()
-                self.cmd_vel_publisher.publish(msg)
-                
-                rqt = ItemRequest.Request()
-                rqt.robot_id = self.robot_id
-                try:
-                    future = self.offload_service.call_async(rqt)
-                    rclpy.spin_until_future_complete(self, future)
-                    response = future.result()
-                    if response.success:
-                        self.get_logger().info('Successfully offloaded item!')
-                        self.holding_item = False
-                        self.item_color = None
-                        self.state = State.FORWARD
-                    else:
-                        self.get_logger().info('Failed to offload item: ' + response.message)
-                        # Try a slightly different position
-                        self.state = State.NAVIGATING_TO_ZONE
-                except Exception as e:
-                    self.get_logger().info(f'Service call failed: {str(e)}')
 
             case _:
                 pass
