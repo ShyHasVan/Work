@@ -78,12 +78,14 @@ class RobotController(Node):
         
         # Initialize Nav2 after basic setup
         self.navigator = BasicNavigator()
+        
+        # Wait for transform to be ready
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         
-        # Set initial pose for Nav2
+        # Set initial pose for Nav2 using odom frame
         initial_pose = PoseStamped()
-        initial_pose.header.frame_id = 'map'
+        initial_pose.header.frame_id = 'odom'  # Changed from 'map' to 'odom'
         initial_pose.header.stamp = self.get_clock().now().to_msg()
         initial_pose.pose = self.pose
         
@@ -407,29 +409,27 @@ class RobotController(Node):
 
     def navigate_to_pose(self, x, y):
         try:
-            # Wait for transform to be available
-            self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
-            
             goal_pose = PoseStamped()
-            goal_pose.header.frame_id = 'map'
+            goal_pose.header.frame_id = 'odom'  # Changed from 'map' to 'odom'
             goal_pose.header.stamp = self.get_clock().now().to_msg()
             goal_pose.pose.position.x = x
             goal_pose.pose.position.y = y
             goal_pose.pose.orientation.w = 1.0
             
+            # Set a shorter timeout for navigation
             self.navigator.goToPose(goal_pose)
             
+            timeout_count = 0
             while not self.navigator.isTaskComplete():
                 feedback = self.navigator.getFeedback()
-                if feedback and feedback.navigation_duration > 180.0:  # 3-minute timeout
+                timeout_count += 1
+                if timeout_count > 50:  # Shorter timeout
                     self.navigator.cancelTask()
                     return False
+                self.get_logger().info('Navigating to goal...')
                 
             return self.navigator.isTaskComplete()
             
-        except TransformException as e:
-            self.get_logger().error(f'Transform error: {str(e)}')
-            return False
         except Exception as e:
             self.get_logger().error(f'Navigation error: {str(e)}')
             return False
