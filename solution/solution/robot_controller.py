@@ -60,12 +60,10 @@ ZONES = {
 
 # Finite state machine (FSM) states
 class State(Enum):
-    SEARCHING = 0      # Looking for items
-    APPROACHING = 1    # Moving towards detected item
-    COLLECTING = 2     # Picking up item
-    NAVIGATING = 3     # Moving to appropriate zone
-    DEPOSITING = 4     # Depositing item in zone
-    AVOIDING = 5       # Avoiding obstacles
+    FORWARD = 0       # Basic movement state (from week 4/5)
+    TURNING = 1       # Turning to avoid obstacles or explore
+    COLLECTING = 2    # Moving towards and picking up items
+    OFFLOADING = 3    # Depositing items in zones
 
 
 class RobotController(Node):
@@ -74,7 +72,7 @@ class RobotController(Node):
         super().__init__('robot_controller')
         
         # Class variables used to store persistent values between executions of callbacks and control loop
-        self.state = State.SEARCHING # Current FSM state
+        self.state = State.FORWARD # Current FSM state
         self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
         self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
         self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
@@ -166,6 +164,15 @@ class RobotController(Node):
         self.timer_period = 0.1 # 100 milliseconds = 10 Hz
         self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
 
+        # Track zone states internally
+        self.zone_colors = {
+            'cyan': None,
+            'purple': None,
+            'green': None,
+            'pink': None
+        }
+        self.current_zone = None  # Track which zone we're in
+
     def item_callback(self, msg):
         self.items = msg
         if len(msg.data) > 0:
@@ -251,115 +258,181 @@ class RobotController(Node):
         self.cmd_vel_publisher.publish(msg)
         return distance < 0.1  # Return True if at target
 
+    # Add new method to check if in a zone
+    def check_current_zone(self):
+        for zone_name, pos in ZONES.items():
+            if math.dist((self.pose.position.x, self.pose.position.y), (pos['x'], pos['y'])) < 0.5:
+                return zone_name
+        return None
+
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
         self.get_logger().info(f'State: {self.state.name}')
         
         match self.state:
-            case State.SEARCHING:
+            case State.FORWARD:
+                self.get_logger().info(f"Moving forward {self.goal_distance:.2f} metres")
+                # Handle obstacle detection
                 if self.scan_triggered[SCAN_FRONT]:
-                    self.state = State.AVOIDING
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = random.uniform(150, 170)
+                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    return
+                
+                if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = random.uniform(45, 90)
+                    self.turn_direction = TURN_RIGHT if self.scan_triggered[SCAN_LEFT] else TURN_LEFT
                     return
 
+                # Check for items
                 if len(self.items.data) > 0:
-                    self.state = State.APPROACHING
+                    self.state = State.COLLECTING
                     return
 
-                # Random walk behavior
+                # Forward movement
                 msg = Twist()
                 msg.linear.x = LINEAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
 
-            case State.APPROACHING:
-                if len(self.items.data) == 0:
-                    self.state = State.SEARCHING
-                    return
+                # Check if we've reached goal distance
+                difference_x = self.pose.position.x - self.previous_pose.position.x
+                difference_y = self.pose.position.y - self.previous_pose.position.y
+                distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
 
-                # Find closest item
-                closest_item = max(self.items.data, key=lambda x: x.diameter)
-                
-                # Calculate approach parameters
-                angle_to_item = closest_item.x / 320.0
-                distance = 32.4 * float(closest_item.diameter) ** -0.75
+                if distance_travelled >= self.goal_distance:
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = random.uniform(30, 150)
+                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
 
-                if distance < PICKUP_DISTANCE:
+            case State.TURNING:
+                self.get_logger().info(f"Turning {self.turn_direction} by {self.turn_angle:.2f} degrees")
+                if len(self.items.data) > 0:
                     self.state = State.COLLECTING
                     return
 
-                # Proportional control for approach
                 msg = Twist()
-                msg.linear.x = 0.25 * distance
-                msg.angular.z = angle_to_item
+                msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
+
+                yaw_difference = angles.normalize_angle(self.yaw - self.previous_yaw)
+
+                if math.fabs(yaw_difference) >= math.radians(self.turn_angle):
+                    self.previous_pose = self.pose
+                    self.goal_distance = random.uniform(1.0, 2.0)
+                    self.state = State.FORWARD
 
             case State.COLLECTING:
-                # Stop movement
-                self.cmd_vel_publisher.publish(Twist())
-                
-                # Attempt pickup
-                request = ItemRequest.Request()
-                request.robot_id = self.robot_id
-                
-                try:
-                    future = self.pick_up_service.call_async(request)
-                    rclpy.spin_until_future_complete(self, future)
-                    response = future.result()
-                    
-                    if response.success:
-                        self.get_logger().info('Item collected successfully')
-                        self.state = State.NAVIGATING
-                    else:
-                        self.get_logger().info(f'Failed to collect item: {response.message}')
-                        self.state = State.APPROACHING
-                except Exception as e:
-                    self.get_logger().error(f'Service call failed: {str(e)}')
-                    self.state = State.SEARCHING
-
-            case State.NAVIGATING:
-                if not self.current_item:
-                    self.state = State.SEARCHING
+                if len(self.items.data) == 0:
+                    self.previous_pose = self.pose
+                    self.state = State.FORWARD
                     return
-                
-                # Select appropriate zone based on item color
-                # This is where you'd implement zone selection logic
-                target_zone = ZONES['cyan']  # Example - implement proper selection
-                
-                if self.move_to_pose(target_zone['x'], target_zone['y']):
-                    self.state = State.DEPOSITING
 
-            case State.DEPOSITING:
-                request = ItemRequest.Request()
-                request.robot_id = self.robot_id
-                
-                try:
-                    future = self.offload_service.call_async(request)
-                    rclpy.spin_until_future_complete(self, future)
-                    response = future.result()
-                    
-                    if response.success:
-                        self.get_logger().info('Item deposited successfully')
-                    else:
-                        self.get_logger().info(f'Failed to deposit item: {response.message}')
-                    
-                    self.state = State.SEARCHING
-                except Exception as e:
-                    self.get_logger().error(f'Service call failed: {str(e)}')
-                    self.state = State.SEARCHING
+                item = self.items.data[0]
+                estimated_distance = 32.4 * float(item.diameter) ** -0.75
+                self.get_logger().info(f"Collecting item at distance {estimated_distance:.2f}")
 
-            case State.AVOIDING:
-                # Basic obstacle avoidance
+                if estimated_distance <= PICKUP_DISTANCE:
+                    request = ItemRequest.Request()
+                    request.robot_id = self.robot_id
+                    try:
+                        future = self.pick_up_service.call_async(request)
+                        rclpy.spin_until_future_complete(self, future)
+                        response = future.result()
+                        if response.success:
+                            self.get_logger().info('Item picked up')
+                            self.current_item = item
+                            self.state = State.OFFLOADING
+                        else:
+                            self.get_logger().info('Unable to pick up item: ' + response.message)
+                            # Move away slightly and try again
+                            self.previous_pose = self.pose
+                            self.goal_distance = random.uniform(0.5, 1.0)
+                            self.state = State.FORWARD
+                    except Exception as e:
+                        self.get_logger().error(f'Pickup failed: {str(e)}')
+                        self.state = State.FORWARD
+                    return
+
                 msg = Twist()
-                if self.scan_triggered[SCAN_LEFT] and self.scan_triggered[SCAN_RIGHT]:
-                    msg.angular.z = ANGULAR_VELOCITY * random.choice([TURN_LEFT, TURN_RIGHT])
-                elif self.scan_triggered[SCAN_LEFT]:
-                    msg.angular.z = ANGULAR_VELOCITY * TURN_RIGHT
-                else:
-                    msg.angular.z = ANGULAR_VELOCITY * TURN_LEFT
-                
+                msg.linear.x = 0.25 * estimated_distance
+                msg.angular.z = item.x / 320.0
                 self.cmd_vel_publisher.publish(msg)
+                return
+
+            case State.OFFLOADING:
+                if not self.current_item:
+                    self.get_logger().info('No item held, returning to FORWARD')
+                    self.state = State.FORWARD
+                    return
+
+                # Check if we're already in a zone
+                self.current_zone = self.check_current_zone()
                 
-                if not any(self.scan_triggered):
-                    self.state = State.SEARCHING
+                if self.current_zone:
+                    zone_color = self.zone_colors[self.current_zone]
+                    if zone_color is None or zone_color == self.current_item.colour:
+                        request = ItemRequest.Request()
+                        request.robot_id = self.robot_id
+                        try:
+                            future = self.offload_service.call_async(request)
+                            rclpy.spin_until_future_complete(self, future)
+                            response = future.result()
+                            if response.success:
+                                self.get_logger().info(f'Successfully offloaded item in {self.current_zone} zone')
+                                # Only update zone color if this was a successful deposit
+                                if 'deposited' in response.message.lower():
+                                    if self.zone_colors[self.current_zone] is None:
+                                        self.zone_colors[self.current_zone] = self.current_item.colour
+                                        self.get_logger().info(f'Zone {self.current_zone} now accepts {self.current_item.colour} items')
+                            else:
+                                # Item was offloaded but not deposited
+                                self.get_logger().info(f'Failed to deposit in {self.current_zone} zone: {response.message}')
+                                self.state = State.FORWARD
+                        except Exception as e:
+                            self.get_logger().error(f'Offload service call failed: {str(e)}')
+                            self.state = State.FORWARD
+                        return
+                
+                # Find and move to suitable zone
+                target_zone = None
+                for zone_name, color in self.zone_colors.items():
+                    if color is None or color == self.current_item.colour:
+                        target_zone = zone_name
+                        self.get_logger().info(f'Moving to {zone_name} zone')
+                        break
+                
+                if target_zone:
+                    if self.scan_triggered[SCAN_FRONT] or \
+                       self.scan_triggered[SCAN_LEFT] or \
+                       self.scan_triggered[SCAN_RIGHT]:
+                        self.get_logger().info('Obstacle detected, avoiding')
+                        self.previous_yaw = self.yaw
+                        self.state = State.TURNING
+                        self.turn_angle = random.uniform(45, 90)
+                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                        return
+                    
+                    if self.move_to_pose(ZONES[target_zone]['x'], ZONES[target_zone]['y']):
+                        return
+                else:
+                    # No suitable zone, offload item where we are
+                    self.get_logger().info('No suitable zone found, offloading item in current location')
+                    request = ItemRequest.Request()
+                    request.robot_id = self.robot_id
+                    try:
+                        future = self.offload_service.call_async(request)
+                        rclpy.spin_until_future_complete(self, future)
+                        response = future.result()
+                        if response.success:
+                            self.get_logger().info('Item offloaded in current location')
+                    except Exception as e:
+                        self.get_logger().error(f'Offload failed: {str(e)}')
+                    
+                self.state = State.FORWARD
 
     def destroy_node(self):
         msg = Twist()
