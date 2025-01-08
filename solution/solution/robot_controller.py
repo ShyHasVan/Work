@@ -236,6 +236,15 @@ class RobotController(Node):
         self.scan_triggered[SCAN_RIGHT] = min(right_ranges) < SCAN_THRESHOLD
 
     def move_to_pose(self, target_x, target_y):
+        # Check for obstacles first
+        if self.scan_triggered[SCAN_FRONT]:
+            self.get_logger().info('Front obstacle detected while moving to pose')
+            return False
+        
+        if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
+            self.get_logger().info('Side obstacle detected while moving to pose')
+            return False
+        
         # Calculate distance and angle to target
         dx = target_x - self.pose.position.x
         dy = target_y - self.pose.position.y
@@ -399,21 +408,40 @@ class RobotController(Node):
                 
                 # Find and move to suitable zone
                 target_zone = None
+                blocked_attempts = 0  # Track failed attempts
+
+                # Try each zone until we find one we can reach
                 for zone_name, color in self.zone_colors.items():
                     if color is None or color == self.current_item.colour:
                         target_zone = zone_name
-                        self.get_logger().info(f'Moving to {zone_name} zone')
-                        break
-                
+                        self.get_logger().info(f'Attempting to move to {zone_name} zone')
+                        
+                        # Try to move to this zone
+                        if self.move_to_pose(ZONES[target_zone]['x'], ZONES[target_zone]['y']):
+                            return
+                        
+                        # If blocked by obstacles, try another zone
+                        blocked_attempts += 1
+                        if blocked_attempts >= len(ZONES):
+                            self.get_logger().info('All zones blocked, offloading item in current location')
+                            # Rest of offloading code...
+
                 if target_zone:
-                    if self.scan_triggered[SCAN_FRONT] or \
-                       self.scan_triggered[SCAN_LEFT] or \
-                       self.scan_triggered[SCAN_RIGHT]:
-                        self.get_logger().info('Obstacle detected, avoiding')
+                    # More aggressive obstacle avoidance
+                    if self.scan_triggered[SCAN_FRONT]:
+                        self.get_logger().info('Front obstacle detected, making large turn')
+                        self.previous_yaw = self.yaw
+                        self.state = State.TURNING
+                        self.turn_angle = random.uniform(150, 170)  # Larger turn angle for front obstacles
+                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                        return
+                    
+                    if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
+                        self.get_logger().info('Side obstacle detected, turning away')
                         self.previous_yaw = self.yaw
                         self.state = State.TURNING
                         self.turn_angle = random.uniform(45, 90)
-                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                        self.turn_direction = TURN_RIGHT if self.scan_triggered[SCAN_LEFT] else TURN_LEFT
                         return
                     
                     if self.move_to_pose(ZONES[target_zone]['x'], ZONES[target_zone]['y']):
