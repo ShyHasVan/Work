@@ -54,7 +54,7 @@ class State(Enum):
     FORWARD = 0
     TURNING = 1
     COLLECTING = 2
-    DEPOSITING = 3  # Combined state for navigation and offloading
+    OFFLOADING = 3  # Renamed from DEPOSITING
 
 
 class RobotController(Node):
@@ -306,7 +306,7 @@ class RobotController(Node):
                             self.get_logger().info('Successfully picked up item!')
                             self.holding_item = True
                             self.item_color = closest_item.colour
-                            self.state = State.DEPOSITING
+                            self.state = State.OFFLOADING
                             # Start with random movement to find zones
                             self.goal_distance = random.uniform(1.0, 2.0)
                             self.previous_pose = self.pose
@@ -319,7 +319,7 @@ class RobotController(Node):
                     msg.angular.z = max(-0.5, min(0.5, angle_to_item))
                     self.cmd_vel_publisher.publish(msg)
 
-            case State.DEPOSITING:
+            case State.OFFLOADING:
                 if not self.holding_item:
                     self.state = State.FORWARD
                     return
@@ -328,24 +328,22 @@ class RobotController(Node):
                 target, distance = self.get_nearest_zone()
                 
                 if not target:
-                    # No compatible zone found, do random walk
+                    # No compatible zone found, do random walk like in FORWARD state
+                    msg = Twist()
+                    msg.linear.x = LINEAR_VELOCITY
+                    self.cmd_vel_publisher.publish(msg)
+
+                    # Calculate distance traveled
                     difference_x = self.pose.position.x - self.previous_pose.position.x
                     difference_y = self.pose.position.y - self.previous_pose.position.y
                     distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
 
-                    msg = Twist()
                     if distance_travelled >= self.goal_distance:
-                        # Change direction randomly
+                        self.state = State.TURNING
                         self.previous_yaw = self.yaw
-                        self.turn_angle = random.uniform(45, 180)
+                        self.turn_angle = random.uniform(30, 150)
                         self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                        msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
-                        if math.fabs(angles.normalize_angle(self.yaw - self.previous_yaw)) >= math.radians(self.turn_angle):
-                            self.previous_pose = self.pose
-                            self.goal_distance = random.uniform(1.0, 2.0)
-                    else:
-                        msg.linear.x = LINEAR_VELOCITY
-                    self.cmd_vel_publisher.publish(msg)
+                        self.get_logger().info(f"Goal reached, turning {'left' if self.turn_direction == TURN_LEFT else 'right'} by {self.turn_angle:.2f} degrees")
                     return
 
                 # We found a compatible zone, navigate to it
@@ -372,15 +370,17 @@ class RobotController(Node):
                             self.holding_item = False
                             self.item_color = None
                             self.state = State.FORWARD
+                            self.previous_pose = self.pose
+                            self.goal_distance = random.uniform(1.0, 2.0)
                         else:
                             self.get_logger().info('Failed to offload item: ' + response.message)
-                            # Back up and try a different approach
-                            self.previous_pose = self.pose
-                            self.goal_distance = random.uniform(0.5, 1.0)
+                            # Back up and try again
+                            msg.linear.x = -0.1
+                            self.cmd_vel_publisher.publish(msg)
                     except Exception as e:
                         self.get_logger().info(f'Service call failed: {str(e)}')
                 else:
-                    # Two-phase movement with smoother transitions
+                    # Two-phase movement: align then move
                     if abs(angle_diff) > 0.1:
                         msg.angular.z = max(-0.5, min(0.5, angle_diff))
                         self.get_logger().info(f'Aligning with zone, angle diff: {math.degrees(angle_diff):.2f}°')
