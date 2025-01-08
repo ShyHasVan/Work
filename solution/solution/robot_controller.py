@@ -329,21 +329,35 @@ class RobotController(Node):
                     return
 
                 target, distance = self.get_nearest_zone()
+                
                 if not target:
-                    # No compatible zone found, do random walk
+                    # No compatible zone found, do random walk like FORWARD state
                     msg = Twist()
-                    msg.linear.x = 0.2
+                    msg.linear.x = LINEAR_VELOCITY
                     self.cmd_vel_publisher.publish(msg)
-                    return
 
-                try:
-                    # Try Nav2 for zone navigation
-                    target_pos = self.zones[target]
-                    success = self.navigate_to_pose(target_pos['x'], target_pos['y'])
-                    
-                    if success and distance < 0.5:
-                        rqt = ItemRequest.Request()
-                        rqt.robot_id = self.robot_id
+                    difference_x = self.pose.position.x - self.previous_pose.position.x
+                    difference_y = self.pose.position.y - self.previous_pose.position.y
+                    distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
+
+                    if distance_travelled >= self.goal_distance:
+                        self.state = State.TURNING
+                        self.previous_yaw = self.yaw
+                        self.turn_angle = random.uniform(30, 150)
+                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                        self.previous_pose = self.pose  # Update previous pose before turning
+                    return  # Important: return here to ensure the state change takes effect
+
+                # We found a compatible zone
+                target_pos = self.zones[target]
+                msg = self.move_to_zone(target_pos, distance)
+                self.cmd_vel_publisher.publish(msg)
+
+                # Try to offload when close enough
+                if distance < 0.5:
+                    rqt = ItemRequest.Request()
+                    rqt.robot_id = self.robot_id
+                    try:
                         future = self.offload_service.call_async(rqt)
                         rclpy.spin_until_future_complete(self, future)
                         response = future.result()
@@ -351,13 +365,10 @@ class RobotController(Node):
                             self.holding_item = False
                             self.item_color = None
                             self.state = State.FORWARD
-                except Exception as e:
-                    # Fallback to basic movement if Nav2 fails
-                    self.get_logger().warn(f'Nav2 failed: {str(e)}. Using basic movement.')
-                    msg = Twist()
-                    msg.linear.x = 0.2
-                    msg.angular.z = 0.1
-                    self.cmd_vel_publisher.publish(msg)
+                            self.previous_pose = self.pose
+                            self.goal_distance = random.uniform(1.0, 2.0)
+                    except Exception as e:
+                        self.get_logger().info(f'Service call failed: {str(e)}')
 
             case _:
                 pass
@@ -380,32 +391,45 @@ class RobotController(Node):
         min_dist = float('inf')
         nearest = None
         
-        self.get_logger().info(f'Searching for zone - Current item color: {self.item_color}')
         for color, pos in self.zones.items():
             # Check if zone is compatible with our item
             assigned_color = pos.get('assigned_color')
-            self.get_logger().info(f'Checking zone {color} - Assigned color: {assigned_color}')
             
             if assigned_color is not None and assigned_color != self.item_color:
-                self.get_logger().info(f'Zone {color} incompatible - assigned to {assigned_color}')
                 continue
             
             dx = pos['x'] - self.pose.position.x
             dy = pos['y'] - self.pose.position.y
             dist = math.sqrt(dx*dx + dy*dy)
             
-            self.get_logger().info(f'Zone {color} - Distance: {dist:.2f}m')
-            
             if dist < min_dist:
                 min_dist = dist
                 nearest = color
         
-        if nearest:
-            self.get_logger().info(f'Selected zone {nearest} at distance {min_dist:.2f}m')
-        else:
-            self.get_logger().info('No suitable zone found')
-        
         return nearest, min_dist
+
+    def move_to_zone(self, target_pos, distance):
+        # Similar to item collection logic from week 5
+        msg = Twist()
+        
+        # Calculate angle to target
+        angle_to_target = math.atan2(
+            target_pos['y'] - self.pose.position.y,
+            target_pos['x'] - self.pose.position.x
+        )
+        
+        # Calculate angle difference
+        angle_diff = angles.normalize_angle(angle_to_target - self.yaw)
+        
+        if abs(angle_diff) > 0.1:
+            # Turn towards target
+            msg.angular.z = max(-0.5, min(0.5, angle_diff))
+        else:
+            # Move towards target
+            msg.linear.x = max(0.1, min(0.3, 0.2 * distance))
+            msg.angular.z = 0.1 * angle_diff  # Small correction while moving
+            
+        return msg
 
     def navigate_to_pose(self, x, y):
         try:
