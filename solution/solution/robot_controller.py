@@ -36,6 +36,12 @@ from enum import Enum
 import random
 import math
 
+from nav2_simple_commander.robot_navigatorimport BasicNavigator
+from geometry_msgs.msg import PoseStamped
+from tf2_ros import TransformException
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
+
 LINEAR_VELOCITY  = 0.3 # Metres per second
 ANGULAR_VELOCITY = 0.5 # Radians per second
 
@@ -64,6 +70,14 @@ class RobotController(Node):
         
         # Add initialization check
         self.get_logger().info('Initializing robot controller...')
+        
+        # Initialize Nav2
+        self.navigator= BasicNavigator()
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        
+        # Wait for Nav2 to be ready
+        self.navigator.waitUntilNav2Active()
         
         # Class variables used to store persistent values between executions of callbacks and control loop
         self.state = State.FORWARD # Current FSM state
@@ -323,63 +337,23 @@ class RobotController(Node):
                     return
 
                 target, distance = self.get_nearest_zone()
-                
-                if not target:
-                    # No compatible zone found, do random walk like FORWARD state
-                    msg = Twist()
-                    msg.linear.x = LINEAR_VELOCITY
-                    self.cmd_vel_publisher.publish(msg)
-
-                    difference_x = self.pose.position.x - self.previous_pose.position.x
-                    difference_y = self.pose.position.y - self.previous_pose.position.y
-                    distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
-
-                    if distance_travelled >= self.goal_distance:
-                        self.state = State.TURNING
-                        self.previous_yaw = self.yaw
-                        self.turn_angle = random.uniform(30, 150)
-                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                        self.previous_pose = self.pose  # Update previous pose before turning
-                    return  # Important: return here to ensure the state change takes effect
-
-                # We found a compatible zone
-                target_pos = self.zones[target]
-                dx = target_pos['x'] - self.pose.position.x
-                dy = target_pos['y'] - self.pose.position.y
-                angle_to_target = math.atan2(dy, dx)
-                angle_diff = angles.normalize_angle(angle_to_target - self.yaw)
-                
-                msg = Twist()
-                if distance < 0.5:  # Close enough to offload
-                    msg.linear.x = 0.0
-                    msg.angular.z = 0.0
-                    self.cmd_vel_publisher.publish(msg)
-                    
-                    rqt = ItemRequest.Request()
-                    rqt.robot_id = self.robot_id
-                    try:
-                        future = self.offload_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
-                        response = future.result()
-                        if response.success:
-                            self.holding_item = False
-                            self.item_color = None
-                            self.state = State.FORWARD
-                            self.previous_pose = self.pose
-                            self.goal_distance = random.uniform(1.0, 2.0)
-                        else:
-                            msg.linear.x = -0.1
-                            self.cmd_vel_publisher.publish(msg)
-                    except Exception as e:
-                        self.get_logger().info(f'Service call failed: {str(e)}')
+                if target:
+                    target_pos = self.zones[target]
+                    if self.navigate_to_pose(target_pos['x'], target_pos['y']):
+                        # Try to offload
+                        rqt = ItemRequest.Request()
+                        rqt.robot_id = self.robot_id
+                        try:
+                            future = self.offload_service.call_async(rqt)
+                            rclpy.spin_until_future_complete(self, future)
+                            response = future.result()
+                            if response.success:
+                                self.holding_item = False
+                                self.item_color = None
+                                self.state = State.FORWARD
                 else:
-                    # Two-phase movement: align then move
-                    if abs(angle_diff) > 0.1:
-                        msg.angular.z = max(-0.5, min(0.5, angle_diff))
-                    else:
-                        msg.linear.x = max(0.1, min(0.3, 0.2 * distance))
-                        msg.angular.z = 0.1 * angle_diff
-                    self.cmd_vel_publisher.publish(msg)
+                    # No compatible zone, explore using Nav2's built-in exploration
+                    self.navigator.explorationTask()
 
             case _:
                 pass
@@ -428,6 +402,24 @@ class RobotController(Node):
             self.get_logger().info('No suitable zone found')
         
         return nearest, min_dist
+
+    def navigate_to_pose(self, x, y):
+        goal_pose = PoseStamped()
+        goal_pose.header.frame_id = 'map'
+        goal_pose.header.stamp = self.get_clock().now().to_msg()
+        goal_pose.pose.position.x = x
+        goal_pose.pose.position.y = y
+        goal_pose.pose.orientation.w = 1.0
+        
+        self.navigator.goToPose(goal_pose)
+        
+        while not self.navigator.isTaskComplete():
+            feedback = self.navigator.getFeedback()
+            if feedback.navigation_duration > 180:  # 3-minute timeout
+                self.navigator.cancelTask()
+                return False
+        
+        return self.navigator.isTaskComplete()
 
 def main(args=None):
     rclpy.init(args=args)
