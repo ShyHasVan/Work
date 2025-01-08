@@ -281,41 +281,43 @@ class RobotController(Node):
         match self.state:
             case State.FORWARD:
                 self.get_logger().info(f"Moving forward {self.goal_distance:.2f} metres")
-                # Handle obstacle detection
-                if self.scan_triggered[SCAN_FRONT]:
+                
+                # Check for items first
+                if len(self.items.data) > 0:
+                    self.state = State.COLLECTING
+                    return
+
+                # Handle obstacle detection and movement
+                msg = Twist()
+                if self.scan_triggered[SCAN_FRONT] or self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
+                    msg.linear.x = 0.0
+                    self.cmd_vel_publisher.publish(msg)
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
-                    self.turn_angle = random.uniform(150, 170)
+                    self.turn_angle = random.uniform(90, 120)
+                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    return
+                
+                # More aggressive obstacle avoidance
+                if self.scan_triggered[SCAN_FRONT]:
+                    self.get_logger().info('Front obstacle detected, making large turn')
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = random.uniform(150, 170)  # Larger turn angle for front obstacles
                     self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
                     return
                 
                 if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
+                    self.get_logger().info('Side obstacle detected, turning away')
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
                     self.turn_angle = random.uniform(45, 90)
                     self.turn_direction = TURN_RIGHT if self.scan_triggered[SCAN_LEFT] else TURN_LEFT
                     return
-
-                # Check for items
-                if len(self.items.data) > 0:
-                    self.state = State.COLLECTING
-                    return
-
+                
                 # Forward movement
-                msg = Twist()
                 msg.linear.x = LINEAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
-
-                # Check if we've reached goal distance
-                difference_x = self.pose.position.x - self.previous_pose.position.x
-                difference_y = self.pose.position.y - self.previous_pose.position.y
-                distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
-
-                if distance_travelled >= self.goal_distance:
-                    self.previous_yaw = self.yaw
-                    self.state = State.TURNING
-                    self.turn_angle = random.uniform(30, 150)
-                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
 
             case State.TURNING:
                 self.get_logger().info(f"Turning {self.turn_direction} by {self.turn_angle:.2f} degrees")
@@ -331,8 +333,9 @@ class RobotController(Node):
 
                 if math.fabs(yaw_difference) >= math.radians(self.turn_angle):
                     self.previous_pose = self.pose
-                    self.goal_distance = random.uniform(1.0, 2.0)
+                    self.goal_distance = random.uniform(0.5, 1.0)
                     self.state = State.FORWARD
+                    self.get_logger().info(f"Finished turning, driving forward by {self.goal_distance:.2f} metres")
 
             case State.COLLECTING:
                 if len(self.items.data) == 0:
@@ -362,9 +365,9 @@ class RobotController(Node):
                             self.goal_distance = random.uniform(0.5, 1.0)
                             self.state = State.FORWARD
                     except Exception as e:
-                        self.get_logger().error(f'Pickup failed: {str(e)}')
+                        self.get_logger().error(f'Service call failed: {str(e)}')
                         self.state = State.FORWARD
-                    return
+                        return
 
                 msg = Twist()
                 msg.linear.x = 0.25 * estimated_distance
@@ -402,7 +405,7 @@ class RobotController(Node):
                                 self.get_logger().info(f'Failed to deposit in {self.current_zone} zone: {response.message}')
                                 self.state = State.FORWARD
                         except Exception as e:
-                            self.get_logger().error(f'Offload service call failed: {str(e)}')
+                            self.get_logger().error(f'Service call failed: {str(e)}')
                             self.state = State.FORWARD
                         return
                 
@@ -458,7 +461,7 @@ class RobotController(Node):
                         if response.success:
                             self.get_logger().info('Item offloaded in current location')
                     except Exception as e:
-                        self.get_logger().error(f'Offload failed: {str(e)}')
+                        self.get_logger().error(f'Service call failed: {str(e)}')
                     
                 self.state = State.FORWARD
 
