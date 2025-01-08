@@ -54,7 +54,7 @@ class State(Enum):
     FORWARD = 0
     TURNING = 1
     COLLECTING = 2
-    OFFLOADING = 3  # Renamed from DEPOSITING
+    OFFLOADING = 3  
 
 
 class RobotController(Node):
@@ -326,17 +326,18 @@ class RobotController(Node):
 
                 # First, try to find a compatible zone
                 target, distance = self.get_nearest_zone()
+                self.get_logger().info(f'Holding item of color: {self.item_color}')
                 
                 if not target:
-                    # No compatible zone found, do random walk like in FORWARD state
+                    self.get_logger().info('No compatible zone found, doing random walk')
                     msg = Twist()
                     msg.linear.x = LINEAR_VELOCITY
                     self.cmd_vel_publisher.publish(msg)
 
-                    # Calculate distance traveled
                     difference_x = self.pose.position.x - self.previous_pose.position.x
                     difference_y = self.pose.position.y - self.previous_pose.position.y
                     distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
+                    self.get_logger().info(f'Distance travelled: {distance_travelled:.2f} / {self.goal_distance:.2f}')
 
                     if distance_travelled >= self.goal_distance:
                         self.state = State.TURNING
@@ -346,13 +347,17 @@ class RobotController(Node):
                         self.get_logger().info(f"Goal reached, turning {'left' if self.turn_direction == TURN_LEFT else 'right'} by {self.turn_angle:.2f} degrees")
                     return
 
-                # We found a compatible zone, navigate to it
+                # We found a compatible zone
                 target_pos = self.zones[target]
                 dx = target_pos['x'] - self.pose.position.x
                 dy = target_pos['y'] - self.pose.position.y
                 angle_to_target = math.atan2(dy, dx)
                 angle_diff = angles.normalize_angle(angle_to_target - self.yaw)
                 
+                self.get_logger().info(f'Moving to {target} zone at ({target_pos["x"]}, {target_pos["y"]})')
+                self.get_logger().info(f'Current position: ({self.pose.position.x:.2f}, {self.pose.position.y:.2f})')
+                self.get_logger().info(f'Distance to zone: {distance:.2f}m, Angle diff: {math.degrees(angle_diff):.2f}°')
+
                 msg = Twist()
                 if distance < 0.5:  # Close enough to offload
                     msg.linear.x = 0.0
@@ -406,7 +411,7 @@ class RobotController(Node):
             if zone.colour in self.zones:
                 # Store the zone's current color assignment if it has one
                 self.zones[zone.colour]['assigned_color'] = zone.assigned_colour if zone.assigned_colour else None
-                self.get_logger().info(f'Zone {zone.colour} status - Assigned color: {zone.assigned_colour}')
+                self.get_logger().info(f'Zone {zone.colour} - Position: ({self.zones[zone.colour]["x"]}, {self.zones[zone.colour]["y"]}), Assigned color: {zone.assigned_colour}')
 
     def get_nearest_zone(self):
         min_dist = float('inf')
