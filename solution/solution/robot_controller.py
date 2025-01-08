@@ -72,12 +72,27 @@ class RobotController(Node):
         self.get_logger().info('Initializing robot controller...')
         
         # Initialize Nav2
-        self.navigator= BasicNavigator()
+        self.navigator = BasicNavigator()
+        
+        # Set initial pose for Nav2
+        initial_pose = PoseStamped()
+        initial_pose.header.frame_id = 'map'
+        initial_pose.header.stamp = self.get_clock().now().to_msg()
+        initial_pose.pose = self.pose
+        
+        self.navigator.setInitialPose(initial_pose)
+        
+        # Wait for Nav2 to be ready with timeout
+        try:
+            self.navigator.waitUntilNav2Active(timeout_sec=10.0)
+        except Exception as e:
+            self.get_logger().error(f'Failed to initialize Nav2: {str(e)}')
+            rclpy.shutdown()
+            return
+
+        # Create transform listener after Nav2 is ready
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        
-        # Wait for Nav2 to be ready
-        self.navigator.waitUntilNav2Active()
         
         # Class variables used to store persistent values between executions of callbacks and control loop
         self.state = State.FORWARD # Current FSM state
@@ -404,22 +419,33 @@ class RobotController(Node):
         return nearest, min_dist
 
     def navigate_to_pose(self, x, y):
-        goal_pose = PoseStamped()
-        goal_pose.header.frame_id = 'map'
-        goal_pose.header.stamp = self.get_clock().now().to_msg()
-        goal_pose.pose.position.x = x
-        goal_pose.pose.position.y = y
-        goal_pose.pose.orientation.w = 1.0
-        
-        self.navigator.goToPose(goal_pose)
-        
-        while not self.navigator.isTaskComplete():
-            feedback = self.navigator.getFeedback()
-            if feedback.navigation_duration > 180:  # 3-minute timeout
-                self.navigator.cancelTask()
-                return False
-        
-        return self.navigator.isTaskComplete()
+        try:
+            # Wait for transform to be available
+            self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+            
+            goal_pose = PoseStamped()
+            goal_pose.header.frame_id = 'map'
+            goal_pose.header.stamp = self.get_clock().now().to_msg()
+            goal_pose.pose.position.x = x
+            goal_pose.pose.position.y = y
+            goal_pose.pose.orientation.w = 1.0
+            
+            self.navigator.goToPose(goal_pose)
+            
+            while not self.navigator.isTaskComplete():
+                feedback = self.navigator.getFeedback()
+                if feedback and feedback.navigation_duration > 180.0:  # 3-minute timeout
+                    self.navigator.cancelTask()
+                    return False
+                
+            return self.navigator.isTaskComplete()
+            
+        except TransformException as e:
+            self.get_logger().error(f'Transform error: {str(e)}')
+            return False
+        except Exception as e:
+            self.get_logger().error(f'Navigation error: {str(e)}')
+            return False
 
 def main(args=None):
     rclpy.init(args=args)
