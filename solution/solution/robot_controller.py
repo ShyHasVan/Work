@@ -417,19 +417,30 @@ class RobotController(Node):
         min_dist = float('inf')
         nearest = None
         
+        self.get_logger().info(f'Searching for zone - Current item color: {self.item_color}')
         for color, pos in self.zones.items():
             # Check if zone is compatible with our item
             assigned_color = pos.get('assigned_color')
+            self.get_logger().info(f'Checking zone {color} - Assigned color: {assigned_color}')
+            
             if assigned_color is not None and assigned_color != self.item_color:
+                self.get_logger().info(f'Zone {color} incompatible - assigned to {assigned_color}')
                 continue
             
             dx = pos['x'] - self.pose.position.x
             dy = pos['y'] - self.pose.position.y
             dist = math.sqrt(dx*dx + dy*dy)
             
+            self.get_logger().info(f'Zone {color} - Distance: {dist:.2f}m')
+            
             if dist < min_dist:
                 min_dist = dist
                 nearest = color
+        
+        if nearest:
+            self.get_logger().info(f'Selected zone {nearest} at distance {min_dist:.2f}m')
+        else:
+            self.get_logger().info('No suitable zone found')
         
         return nearest, min_dist
 
