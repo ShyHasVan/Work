@@ -301,9 +301,10 @@ class RobotController(Node):
                             self.get_logger().info('Successfully picked up item!')
                             self.holding_item = True
                             self.item_color = closest_item.colour
-                            self.state = State.OFFLOADING
                             self.previous_pose = self.pose
                             self.goal_distance = random.uniform(1.0, 2.0)
+                            self.state = State.OFFLOADING  # Ensure we transition to OFFLOADING
+                            self.get_logger().info(f'Transitioning to OFFLOADING state')
                         else:
                             self.get_logger().info('Failed to pick up item: ' + response.message)
                     except Exception as e:
