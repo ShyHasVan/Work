@@ -232,9 +232,9 @@ class RobotController(Node):
 
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
-        # Logging current state and position
-        self.get_logger().info(f'Current state: {self.state}, Position: ({self.pose.position.x:.2f}, {self.pose.position.y:.2f}), ' +
-                              f'Yaw: {math.degrees(self.yaw):.2f}°, Items visible: {len(self.items.data)}')
+        # Single clear state logging message
+        self.get_logger().info(f'STATE: {self.state.name} | Position: ({self.pose.position.x:.2f}, {self.pose.position.y:.2f}) | ' +
+                              f'Holding item: {self.holding_item} | Item color: {self.item_color if self.holding_item else "None"}')
         
         match self.state:
             case State.FORWARD:
@@ -279,19 +279,14 @@ class RobotController(Node):
 
             case State.COLLECTING:
                 if len(self.items.data) == 0:
-                    self.get_logger().info('Lost sight of item, returning to FORWARD state')
-                    self.previous_pose = self.pose
-                    self.goal_distance = random.uniform(1.0, 2.0)
                     self.state = State.FORWARD
                     return
                 
                 closest_item = max(self.items.data, key=lambda x: x.diameter)
-                msg = Twist()
-
-                angle_to_item = closest_item.x / 320.0
                 estimated_distance = 32.4 * float(closest_item.diameter) ** -0.75
                 
                 if estimated_distance < 0.35:
+                    msg = Twist()
                     msg.linear.x = 0.0
                     msg.angular.z = 0.0
                     self.cmd_vel_publisher.publish(msg)
@@ -307,16 +302,16 @@ class RobotController(Node):
                             self.holding_item = True
                             self.item_color = closest_item.colour
                             self.state = State.OFFLOADING
-                            # Start with random movement to find zones
-                            self.goal_distance = random.uniform(1.0, 2.0)
                             self.previous_pose = self.pose
+                            self.goal_distance = random.uniform(1.0, 2.0)
                         else:
                             self.get_logger().info('Failed to pick up item: ' + response.message)
                     except Exception as e:
                         self.get_logger().info(f'Service call failed: {str(e)}')
                 else:
+                    msg = Twist()
                     msg.linear.x = max(0.1, min(0.3, 0.25 * estimated_distance))
-                    msg.angular.z = max(-0.5, min(0.5, angle_to_item))
+                    msg.angular.z = max(-0.5, min(0.5, closest_item.x / 320.0))
                     self.cmd_vel_publisher.publish(msg)
 
             case State.OFFLOADING:
