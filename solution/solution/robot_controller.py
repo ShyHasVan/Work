@@ -303,17 +303,19 @@ class RobotController(Node):
                             self.item_color = closest_item.colour
                             self.previous_pose = self.pose
                             self.goal_distance = random.uniform(1.0, 2.0)
-                            self.state = State.OFFLOADING  # Ensure we transition to OFFLOADING
+                            self.state = State.OFFLOADING
                             self.get_logger().info(f'Transitioning to OFFLOADING state')
+                            return
                         else:
                             self.get_logger().info('Failed to pick up item: ' + response.message)
                     except Exception as e:
                         self.get_logger().info(f'Service call failed: {str(e)}')
-                else:
-                    msg = Twist()
-                    msg.linear.x = max(0.1, min(0.3, 0.25 * estimated_distance))
-                    msg.angular.z = max(-0.5, min(0.5, closest_item.x / 320.0))
-                    self.cmd_vel_publisher.publish(msg)
+                
+                # Only move if we haven't picked up the item
+                msg = Twist()
+                msg.linear.x = max(0.1, min(0.3, 0.25 * estimated_distance))
+                msg.angular.z = max(-0.5, min(0.5, closest_item.x / 320.0))
+                self.cmd_vel_publisher.publish(msg)
 
             case State.OFFLOADING:
                 if not self.holding_item:
