@@ -331,7 +331,7 @@ class RobotController(Node):
                 target, distance = self.get_nearest_zone()
                 
                 if not target:
-                    # No compatible zone found, do random walk like FORWARD state
+                    # No compatible zone found, do random walk (from week 5)
                     msg = Twist()
                     msg.linear.x = LINEAR_VELOCITY
                     self.cmd_vel_publisher.publish(msg)
@@ -345,16 +345,12 @@ class RobotController(Node):
                         self.previous_yaw = self.yaw
                         self.turn_angle = random.uniform(30, 150)
                         self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                        self.previous_pose = self.pose  # Update previous pose before turning
-                    return  # Important: return here to ensure the state change takes effect
+                        self.previous_pose = self.pose
+                    return
 
-                # We found a compatible zone
+                # We found a compatible zone - use week 8's approach
                 target_pos = self.zones[target]
-                msg = self.move_to_zone(target_pos, distance)
-                self.cmd_vel_publisher.publish(msg)
-
-                # Try to offload when close enough
-                if distance < 0.5:
+                if distance < 0.5:  # Close enough to try offloading
                     rqt = ItemRequest.Request()
                     rqt.robot_id = self.robot_id
                     try:
@@ -369,6 +365,10 @@ class RobotController(Node):
                             self.goal_distance = random.uniform(1.0, 2.0)
                     except Exception as e:
                         self.get_logger().info(f'Service call failed: {str(e)}')
+                else:
+                    # Move towards zone using week 8's movement approach
+                    msg = self.move_to_zone(target_pos, distance)
+                    self.cmd_vel_publisher.publish(msg)
 
             case _:
                 pass
@@ -409,26 +409,22 @@ class RobotController(Node):
         return nearest, min_dist
 
     def move_to_zone(self, target_pos, distance):
-        # Similar to item collection logic from week 5
         msg = Twist()
         
-        # Calculate angle to target
+        # Calculate angle to target (like week 8's RETURNING state)
         angle_to_target = math.atan2(
             target_pos['y'] - self.pose.position.y,
             target_pos['x'] - self.pose.position.x
         )
-        
-        # Calculate angle difference
         angle_diff = angles.normalize_angle(angle_to_target - self.yaw)
         
-        if abs(angle_diff) > 0.1:
-            # Turn towards target
-            msg.angular.z = max(-0.5, min(0.5, angle_diff))
-        else:
-            # Move towards target
-            msg.linear.x = max(0.1, min(0.3, 0.2 * distance))
-            msg.angular.z = 0.1 * angle_diff  # Small correction while moving
-            
+        # Use week 8's scaling approach
+        scale_rotation_rate = 0.5
+        msg.angular.z = scale_rotation_rate * angle_diff
+        
+        scale_forward_speed = 0.25
+        msg.linear.x = scale_forward_speed * distance
+        
         return msg
 
     def navigate_to_pose(self, x, y):
