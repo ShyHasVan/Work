@@ -39,6 +39,14 @@ SCAN_RIGHT = 3
 ITEM_PICKUP_DISTANCE = 0.35
 ZONE_DEPOSIT_DISTANCE = 0.5
 
+# Add these constants after the navigation constants
+ZONE_COLORS = {
+    1: "cyan",    # ZONE_CYAN
+    2: "purple",  # ZONE_PURPLE
+    3: "green",   # ZONE_GREEN
+    4: "pink"     # ZONE_PINK
+}
+
 class State(Enum):
     FORWARD = 0
     TURNING = 1
@@ -72,6 +80,7 @@ class RobotController(Node):
         self.zones = ZoneList()
         self.holding_item = False
         self.held_item_color = None
+        self.target_zone = None  # Store the current target zone
         
         # Navigation
         self.tf_buffer = Buffer()
@@ -144,11 +153,27 @@ class RobotController(Node):
             callback_group=timer_cb_group
         )
 
+        # Add zone tracking
+        self.known_zones = {}  # Dictionary to store zone positions {zone_id: (x, y)}
+
     def item_callback(self, msg):
         self.items = msg
 
     def zone_callback(self, msg):
         self.zones = msg
+        # Update our knowledge of zone positions
+        for zone in msg.data:
+            zone_color = ZONE_COLORS.get(zone.zone, "")
+            if zone.size > 0.5:  # If we're close enough to the zone
+                self.known_zones[zone.zone] = (zone.x, zone.y)
+                
+        # Update target zone if we're holding an item and not already depositing
+        if self.holding_item and self.state != State.DEPOSITING:
+            suitable_zone = self.find_suitable_zone()
+            if suitable_zone:
+                self.target_zone = suitable_zone
+                self.state = State.DEPOSITING
+                self.get_logger().info(f'Found suitable zone of color {ZONE_COLORS.get(suitable_zone.zone, "unknown")}')
 
     def odom_callback(self, msg):
         self.pose = msg.pose.pose
@@ -175,8 +200,9 @@ class RobotController(Node):
             return None
             
         for zone in self.zones.data:
+            zone_color = ZONE_COLORS.get(zone.zone, "")
             # If zone matches our item color or is unused (no color assigned)
-            if zone.color == self.held_item_color or zone.color == "":
+            if zone_color == self.held_item_color or zone_color == "":
                 return zone
         return None
 
@@ -217,7 +243,7 @@ class RobotController(Node):
             return False
 
     def control_loop(self):
-        self.get_logger().info(f"STATE: {self.state}")
+        self.get_logger().info(f"STATE: {self.state}, Holding item: {self.held_item_color if self.holding_item else 'No'}")
         
         match self.state:
             case State.FORWARD:
@@ -230,7 +256,9 @@ class RobotController(Node):
                 if self.holding_item:
                     suitable_zone = self.find_suitable_zone()
                     if suitable_zone:
+                        self.target_zone = suitable_zone
                         self.state = State.DEPOSITING
+                        self.get_logger().info(f'Moving to deposit in zone of color {ZONE_COLORS.get(suitable_zone.zone, "unknown")}')
                         return
 
                 # Third priority: Handle obstacle avoidance
@@ -257,14 +285,13 @@ class RobotController(Node):
 
             case State.COLLECTING:
                 if len(self.items.data) == 0:
-                    self.previous_pose = self.pose
                     self.state = State.FORWARD
                     return
                 
                 item = self.items.data[0]
                 estimated_distance = 32.4 * float(item.diameter) ** -0.75
 
-                self.get_logger().info(f'Estimated distance {estimated_distance}')
+                self.get_logger().info(f'Estimated distance to item: {estimated_distance}')
 
                 if estimated_distance <= ITEM_PICKUP_DISTANCE:
                     request = ItemRequest.Request()
@@ -274,13 +301,15 @@ class RobotController(Node):
                         rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
-                            self.get_logger().info('Item picked up.')
+                            self.get_logger().info(f'Picked up {item.colour} item')
                             self.holding_item = True
                             self.held_item_color = item.colour
-                            # Change state to FORWARD to immediately check for zones
+                            # Check for suitable zone immediately
                             suitable_zone = self.find_suitable_zone()
                             if suitable_zone:
+                                self.target_zone = suitable_zone
                                 self.state = State.DEPOSITING
+                                self.get_logger().info(f'Found suitable zone of color {ZONE_COLORS.get(suitable_zone.zone, "unknown")}')
                             else:
                                 self.state = State.FORWARD
                             self.items.data = []
@@ -296,15 +325,21 @@ class RobotController(Node):
                 self.cmd_vel_publisher.publish(msg)
 
             case State.DEPOSITING:
-                suitable_zone = self.find_suitable_zone()
-                if not suitable_zone:
+                # If we lost sight of all zones, keep the target_zone if we had one
+                if not self.zones.data and not self.target_zone:
+                    self.state = State.FORWARD
+                    return
+
+                # Use target_zone if we have one, otherwise find a new suitable zone
+                zone_to_navigate = self.target_zone if self.target_zone else self.find_suitable_zone()
+                if not zone_to_navigate:
                     self.state = State.FORWARD
                     return
 
                 # Log navigation attempt
-                self.get_logger().info(f'Navigating to zone at ({suitable_zone.x}, {suitable_zone.y})')
+                self.get_logger().info(f'Navigating to {ZONE_COLORS.get(zone_to_navigate.zone, "unknown")} zone at ({zone_to_navigate.x}, {zone_to_navigate.y})')
                 
-                if self.navigate_to_target(suitable_zone.x, suitable_zone.y, ZONE_DEPOSIT_DISTANCE):
+                if self.navigate_to_target(zone_to_navigate.x, zone_to_navigate.y, ZONE_DEPOSIT_DISTANCE):
                     request = ItemRequest.Request()
                     request.robot_id = self.robot_id
                     try:
@@ -312,9 +347,10 @@ class RobotController(Node):
                         rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
-                            self.get_logger().info('Successfully deposited item in zone')
+                            self.get_logger().info(f'Successfully deposited {self.held_item_color} item in {ZONE_COLORS.get(zone_to_navigate.zone, "unknown")} zone')
                             self.holding_item = False
                             self.held_item_color = None
+                            self.target_zone = None
                         else:
                             self.get_logger().warn(f'Failed to offload: {response.message}')
                     except Exception as e:
