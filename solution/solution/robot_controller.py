@@ -21,6 +21,8 @@ from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.qos import QoSPresetProfiles
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
+from rclpy.transforms import TransformException
+from tf2_ros import Buffer, TransformListener
 
 from std_msgs.msg import Float32
 from geometry_msgs.msg import Twist, Pose, PoseStamped
@@ -133,7 +135,7 @@ class RobotController(Node):
         # 
         # Gazebo ROS differential drive plugin subscribes to these messages, and converts them into left and right wheel speeds
         # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L537-L555
-        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10, callback_group=timer_callback_group)
 
         #self.orientation_publisher = self.create_publisher(Float32, '/orientation', 10)
 
@@ -161,11 +163,34 @@ class RobotController(Node):
             10, callback_group=timer_callback_group
         )
 
-        # Set initial pose
+        # Add after other initializations
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        
+        # Set initial pose using TF
         initial_pose = PoseStamped()
         initial_pose.header.frame_id = 'map'
         initial_pose.header.stamp = self.get_clock().now().to_msg()
-        initial_pose.pose = self.pose  # Use current robot pose
+        
+        # Wait for first transform
+        try:
+            t = self.tf_buffer.lookup_transform(
+                'map',
+                'base_footprint',
+                rclpy.time.Time())
+            
+            initial_pose.pose.position.x = t.transform.translation.x
+            initial_pose.pose.position.y = t.transform.translation.y
+            initial_pose.pose.orientation = t.transform.rotation
+        except TransformException:
+            self.get_logger().warn('Could not get initial pose, using default')
+            initial_pose.pose.position.x = 0.0
+            initial_pose.pose.position.y = 0.0
+            q = quaternion_from_euler(0, 0, 0)
+            initial_pose.pose.orientation.x = q[0]
+            initial_pose.pose.orientation.y = q[1]
+            initial_pose.pose.orientation.z = q[2]
+            initial_pose.pose.orientation.w = q[3]
         
         self.navigator.setInitialPose(initial_pose)
         self.navigator.waitUntilNav2Active()
@@ -228,6 +253,24 @@ class RobotController(Node):
 
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
+        try:
+            t = self.tf_buffer.lookup_transform(
+                'map',
+                'base_footprint',
+                rclpy.time.Time())
+            
+            self.x = t.transform.translation.x
+            self.y = t.transform.translation.y
+            
+            (roll, pitch, yaw) = euler_from_quaternion([
+                t.transform.rotation.x,
+                t.transform.rotation.y,
+                t.transform.rotation.z,
+                t.transform.rotation.w])
+            
+        except TransformException as e:
+            self.get_logger().info(f"{e}")
+
         # Add debug info about items near the start of control_loop
         if len(self.items.data) > 0:
             item = self.items.data[0]
@@ -375,15 +418,23 @@ class RobotController(Node):
                     if Duration.from_msg(feedback.navigation_time) > Duration(seconds=30):
                         self.get_logger().info('Navigation taking too long, canceling...')
                         self.navigator.cancelTask()
+                        self.state = State.FORWARD
                 else:
                     result = self.navigator.getResult()
-                    if result == TaskResult.SUCCEEDED:
-                        self.state = State.OFFLOADING
-                    else:
-                        self.get_logger().info(f'Navigation failed: {result}')
-                        # Try another zone
-                        if not self.set_zone_navigation_goal():
-                            # If no zones available, go back to wandering
+                    match result:
+                        case TaskResult.SUCCEEDED:
+                            self.get_logger().info('Reached zone, backing up slightly...')
+                            self.navigator.backup(backup_dist=0.15, backup_speed=0.025, time_allowance=10)
+                            self.state = State.OFFLOADING
+                        case TaskResult.CANCELED:
+                            self.get_logger().info('Navigation was canceled')
+                            self.state = State.FORWARD
+                        case TaskResult.FAILED:
+                            self.get_logger().info('Navigation failed')
+                            if not self.set_zone_navigation_goal():
+                                self.state = State.FORWARD
+                        case _:
+                            self.get_logger().info('Navigation has invalid status')
                             self.state = State.FORWARD
 
             case State.OFFLOADING:
@@ -441,15 +492,13 @@ class RobotController(Node):
         goal_pose.header.frame_id = 'map'
         goal_pose.header.stamp = self.get_clock().now().to_msg()
         
-        # Position slightly in front of zone
-        approach_distance = 0.35  # Same as item pickup distance
+        # Position directly over zone center
+        goal_pose.pose.position.x = zone.x
+        goal_pose.pose.position.y = zone.y
+        
+        # Calculate angle to face zone center
         angle = math.atan2(zone.y - self.pose.position.y, 
-                          zone.x - self.pose.position.x)
-        
-        goal_pose.pose.position.x = zone.x - approach_distance * math.cos(angle)
-        goal_pose.pose.position.y = zone.y - approach_distance * math.sin(angle)
-        
-        # Set orientation facing the zone
+                           zone.x - self.pose.position.x)
         q = quaternion_from_euler(0, 0, angle)
         goal_pose.pose.orientation.x = q[0]
         goal_pose.pose.orientation.y = q[1]
