@@ -77,6 +77,7 @@ class RobotController(Node):
         self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
         self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
         self.items = ItemList()
+        self.item_held = None  # Track if robot is holding an item
 
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
@@ -340,6 +341,7 @@ class RobotController(Node):
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Successfully picked up item!')
+                            self.item_held = True
                             self.state = State.FORWARD
                         else:
                             self.get_logger().info('Failed to pick up item: ' + response.message)
@@ -375,6 +377,7 @@ class RobotController(Node):
                     response = future.result()
                     if response.success:
                         self.get_logger().info('Successfully offloaded item!')
+                        self.item_held = None
                         self.state = State.FORWARD
                     else:
                         self.get_logger().info('Failed to offload item: ' + response.message)
@@ -402,8 +405,18 @@ class RobotController(Node):
             self.get_logger().warn('No zones visible!')
             return False
         
-        # Choose a random zone to try
-        zone = random.choice(self.zones.data)
+        # Filter zones based on color compatibility
+        compatible_zones = []
+        for zone in self.zones.data:
+            if zone.items_returned == 0 or zone.colour == self.items[self.item_held].colour:
+                compatible_zones.append(zone)
+        
+        if not compatible_zones:
+            self.get_logger().warn('No compatible zones available!')
+            return False
+        
+        # Choose a random compatible zone
+        zone = random.choice(compatible_zones)
         
         goal_pose = PoseStamped()
         goal_pose.header.frame_id = 'map'
