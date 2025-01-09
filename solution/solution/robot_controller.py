@@ -411,29 +411,28 @@ class RobotController(Node):
             case State.NAVIGATING_TO_ZONE:
                 if not self.navigator.isTaskComplete():
                     feedback = self.navigator.getFeedback()
-                    remaining_time = Duration.from_msg(feedback.estimated_time_remaining).nanoseconds / 1e9
-                    self.get_logger().info(f'ETA to zone: {remaining_time:.1f} seconds')
-                    
-                    # Cancel if taking too long
-                    if Duration.from_msg(feedback.navigation_time) > Duration(seconds=30):
-                        self.get_logger().info('Navigation taking too long, canceling...')
-                        self.navigator.cancelTask()
-                        self.state = State.FORWARD
-                else:
-                    result = self.navigator.getResult()
-                    match result:
-                        case TaskResult.SUCCEEDED:
-                            self.get_logger().info('Reached zone, backing up slightly...')
-                            self.navigator.backup(backup_dist=0.15, backup_speed=0.025, time_allowance=10)
+                    if feedback:
+                        remaining_time = Duration.from_msg(feedback.estimated_time_remaining).nanoseconds / 1e9
+                        self.get_logger().info(f'ETA to zone: {remaining_time:.1f} seconds')
+                        
+                        # Cancel if taking too long
+                        if Duration.from_msg(feedback.navigation_time) > Duration(seconds=30):
+                            self.get_logger().info('Navigation taking too long, canceling...')
+                            self.navigator.cancelTask()
+                            self.state = State.FORWARD
+                    else:
+                        result = self.navigator.getResult()
+                        if result == TaskResult.SUCCEEDED:
+                            self.get_logger().info('Reached zone')
                             self.state = State.OFFLOADING
-                        case TaskResult.CANCELED:
+                        elif result == TaskResult.CANCELED:
                             self.get_logger().info('Navigation was canceled')
                             self.state = State.FORWARD
-                        case TaskResult.FAILED:
-                            self.get_logger().info('Navigation failed')
+                        elif result == TaskResult.FAILED:
+                            self.get_logger().info('Navigation failed, trying another zone')
                             if not self.set_zone_navigation_goal():
                                 self.state = State.FORWARD
-                        case _:
+                        else:
                             self.get_logger().info('Navigation has invalid status')
                             self.state = State.FORWARD
 
@@ -485,20 +484,22 @@ class RobotController(Node):
             self.get_logger().warn('No compatible zones available!')
             return False
         
-        # Choose a random compatible zone
-        zone = random.choice(compatible_zones)
+        # Choose closest compatible zone
+        zone = min(compatible_zones, 
+                  key=lambda z: math.sqrt((z.x - self.x)**2 + (z.y - self.y)**2))
         
         goal_pose = PoseStamped()
         goal_pose.header.frame_id = 'map'
         goal_pose.header.stamp = self.get_clock().now().to_msg()
         
-        # Position directly over zone center
-        goal_pose.pose.position.x = zone.x
-        goal_pose.pose.position.y = zone.y
+        # Position in front of zone
+        approach_distance = 0.4  # meters
+        angle = math.atan2(zone.y - self.y, zone.x - self.x)
         
-        # Calculate angle to face zone center
-        angle = math.atan2(zone.y - self.pose.position.y, 
-                           zone.x - self.pose.position.x)
+        goal_pose.pose.position.x = zone.x - approach_distance * math.cos(angle)
+        goal_pose.pose.position.y = zone.y - approach_distance * math.sin(angle)
+        
+        # Face the zone
         q = quaternion_from_euler(0, 0, angle)
         goal_pose.pose.orientation.x = q[0]
         goal_pose.pose.orientation.y = q[1]
