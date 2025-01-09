@@ -40,6 +40,9 @@ ZONE_COLORS = {
     4: "pink"     # ZONE_PINK
 }
 
+ITEM_PICKUP_DISTANCE = 0.35
+ZONE_DEPOSIT_DISTANCE = 0.2  # Size threshold for being close enough to deposit
+
 class State(Enum):
     SEARCHING = 0  # Looking for items or zones
     COLLECTING = 1 # Moving to collect an item
@@ -251,8 +254,12 @@ class RobotController(Node):
                     return
                 
                 item = self.items.data[0]
-                if self.move_to_target(item.x, item.y, float(item.diameter)):
-                    # Try to pick up the item
+                # Obtained by curve fitting from experimental runs
+                estimated_distance = 32.4 * float(item.diameter) ** -0.75
+
+                self.get_logger().info(f'Estimated distance {estimated_distance}')
+
+                if estimated_distance <= ITEM_PICKUP_DISTANCE:
                     request = ItemRequest.Request()
                     request.robot_id = self.robot_id
                     try:
@@ -268,6 +275,13 @@ class RobotController(Node):
                             self.get_logger().info('Failed to pick up: ' + response.message)
                     except Exception as e:
                         self.get_logger().error(f'Service call failed: {e}')
+                    return
+
+                # Move towards item using visual servoing
+                msg = Twist()
+                msg.linear.x = 0.25 * estimated_distance
+                msg.angular.z = item.x / 320.0
+                self.cmd_vel_publisher.publish(msg)
 
             case State.DEPOSITING:
                 suitable_zone = self.find_suitable_zone()
@@ -275,8 +289,14 @@ class RobotController(Node):
                     self.state = State.ROTATING
                     return
 
-                if self.move_to_target(suitable_zone.x, suitable_zone.y, suitable_zone.size):
-                    # Try to deposit the item
+                # Use the same visual servoing approach as item collection
+                msg = Twist()
+                msg.linear.x = 0.25 * (1.0 - suitable_zone.size)  # Move slower as we get closer
+                msg.angular.z = suitable_zone.x / 320.0  # Turn based on zone position in image
+                self.cmd_vel_publisher.publish(msg)
+
+                # Check if we're close enough to deposit
+                if suitable_zone.size >= ZONE_DEPOSIT_DISTANCE:
                     request = ItemRequest.Request()
                     request.robot_id = self.robot_id
                     try:
