@@ -187,23 +187,28 @@ class RobotController(Node):
                 'odom',
                 rclpy.time.Time())
             
-            self.x_to_target = x - self.pose.position.x
-            self.y_to_target = y - self.pose.position.y
-            self.distance_to_target = math.sqrt(
-                self.x_to_target ** 2 + 
-                self.y_to_target ** 2
-            )
-            self.angle_to_target = math.atan2(
-                self.y_to_target,
-                self.x_to_target
-            )
+            # Transform target coordinates to robot's frame
+            x_to_target = x - self.pose.position.x
+            y_to_target = y - self.pose.position.y
+            
+            # Convert to robot's frame
+            angle = math.atan2(y_to_target, x_to_target) - self.yaw
+            distance = math.sqrt(x_to_target ** 2 + y_to_target ** 2)
+            
+            # Normalize angle to [-pi, pi]
+            angle = angles.normalize_angle(angle)
 
-            if self.distance_to_target < close_distance:
+            if distance < close_distance:
                 return True
 
             msg = Twist()
-            msg.angular.z = 0.5 * self.angle_to_target
-            msg.linear.x = 0.25 * self.distance_to_target
+            # Scale angular velocity based on angle difference
+            msg.angular.z = 0.5 * angle
+            # Only move forward if roughly facing the target
+            if abs(angle) < math.pi/4:  # 45 degrees
+                msg.linear.x = 0.25 * distance
+            else:
+                msg.linear.x = 0.0
             self.cmd_vel_publisher.publish(msg)
             return False
 
@@ -216,7 +221,19 @@ class RobotController(Node):
         
         match self.state:
             case State.FORWARD:
-                # Handle obstacle avoidance
+                # First priority: Look for items if not holding one
+                if not self.holding_item and len(self.items.data) > 0:
+                    self.state = State.COLLECTING
+                    return
+
+                # Second priority: Look for zones if holding an item
+                if self.holding_item:
+                    suitable_zone = self.find_suitable_zone()
+                    if suitable_zone:
+                        self.state = State.DEPOSITING
+                        return
+
+                # Third priority: Handle obstacle avoidance
                 if self.scan_triggered[SCAN_FRONT]:
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
@@ -224,19 +241,7 @@ class RobotController(Node):
                     self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
                     return
 
-                # Look for items if not holding one
-                if not self.holding_item and len(self.items.data) > 0:
-                    self.state = State.COLLECTING
-                    return
-
-                # Look for zones if holding an item
-                if self.holding_item:
-                    suitable_zone = self.find_suitable_zone()
-                    if suitable_zone:
-                        self.state = State.DEPOSITING
-                        return
-
-                # Move forward
+                # Move forward if no other priorities
                 msg = Twist()
                 msg.linear.x = LINEAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
