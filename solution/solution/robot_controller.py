@@ -161,6 +161,15 @@ class RobotController(Node):
             10, callback_group=timer_callback_group
         )
 
+        # Set initial pose
+        initial_pose = PoseStamped()
+        initial_pose.header.frame_id = 'map'
+        initial_pose.header.stamp = self.get_clock().now().to_msg()
+        initial_pose.pose = self.pose  # Use current robot pose
+        
+        self.navigator.setInitialPose(initial_pose)
+        self.navigator.waitUntilNav2Active()
+
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
             # Only log when we first see an item
@@ -341,8 +350,8 @@ class RobotController(Node):
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Successfully picked up item!')
-                            self.item_held = True
-                            self.state = State.FORWARD
+                            self.item_held = closest_item  # Store the actual item instead of just True
+                            self.state = State.NAVIGATING_TO_ZONE  # Go directly to navigation
                         else:
                             self.get_logger().info('Failed to pick up item: ' + response.message)
                             # Move slightly closer if pickup failed
@@ -359,14 +368,23 @@ class RobotController(Node):
             case State.NAVIGATING_TO_ZONE:
                 if not self.navigator.isTaskComplete():
                     feedback = self.navigator.getFeedback()
-                    self.get_logger().info(f'Estimated time to zone: {Duration.from_msg(feedback.estimated_time_remaining).nanoseconds / 1e9:.0f} seconds')
+                    remaining_time = Duration.from_msg(feedback.estimated_time_remaining).nanoseconds / 1e9
+                    self.get_logger().info(f'ETA to zone: {remaining_time:.1f} seconds')
+                    
+                    # Cancel if taking too long
+                    if Duration.from_msg(feedback.navigation_time) > Duration(seconds=30):
+                        self.get_logger().info('Navigation taking too long, canceling...')
+                        self.navigator.cancelTask()
                 else:
                     result = self.navigator.getResult()
                     if result == TaskResult.SUCCEEDED:
                         self.state = State.OFFLOADING
                     else:
-                        # Try another zone if navigation failed
-                        self.set_zone_navigation_goal()
+                        self.get_logger().info(f'Navigation failed: {result}')
+                        # Try another zone
+                        if not self.set_zone_navigation_goal():
+                            # If no zones available, go back to wandering
+                            self.state = State.FORWARD
 
             case State.OFFLOADING:
                 rqt = ItemRequest.Request()
@@ -395,6 +413,7 @@ class RobotController(Node):
         msg = Twist()
         self.cmd_vel_publisher.publish(msg)
         self.get_logger().info(f"Stopping: {msg}")
+        self.navigator.lifecycleShutdown()
         super().destroy_node()
 
     def zone_callback(self, msg):
@@ -408,7 +427,7 @@ class RobotController(Node):
         # Filter zones based on color compatibility
         compatible_zones = []
         for zone in self.zones.data:
-            if zone.items_returned == 0 or zone.colour == self.items[self.item_held].colour:
+            if zone.items_returned == 0 or zone.colour == self.item_held.colour:
                 compatible_zones.append(zone)
         
         if not compatible_zones:
@@ -422,19 +441,22 @@ class RobotController(Node):
         goal_pose.header.frame_id = 'map'
         goal_pose.header.stamp = self.get_clock().now().to_msg()
         
-        # Set position slightly in front of zone
-        goal_pose.pose.position.x = zone.x
-        goal_pose.pose.position.y = zone.y
-        
-        # Set orientation facing the zone
+        # Position slightly in front of zone
+        approach_distance = 0.35  # Same as item pickup distance
         angle = math.atan2(zone.y - self.pose.position.y, 
                           zone.x - self.pose.position.x)
+        
+        goal_pose.pose.position.x = zone.x - approach_distance * math.cos(angle)
+        goal_pose.pose.position.y = zone.y - approach_distance * math.sin(angle)
+        
+        # Set orientation facing the zone
         q = quaternion_from_euler(0, 0, angle)
         goal_pose.pose.orientation.x = q[0]
         goal_pose.pose.orientation.y = q[1]
         goal_pose.pose.orientation.z = q[2]
         goal_pose.pose.orientation.w = q[3]
         
+        self.get_logger().info(f'Navigating to zone at ({zone.x:.2f}, {zone.y:.2f})')
         self.navigator.goToPose(goal_pose)
         return True
 
