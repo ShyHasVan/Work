@@ -20,14 +20,16 @@ from rclpy.signals import SignalHandlerOptions
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.qos import QoSPresetProfiles
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.duration import Duration
 
 from std_msgs.msg import Float32
-from geometry_msgs.msg import Twist, Pose
+from geometry_msgs.msg import Twist, Pose, PoseStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from assessment_interfaces.msg import Item, ItemList, ItemHolder
+from assessment_interfaces.msg import Item, ItemList, ZoneList, Zone
 from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
+from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 
 from tf_transformations import euler_from_quaternion
 import angles
@@ -43,33 +45,31 @@ TURN_LEFT = 1 # Postive angular velocity turns left
 TURN_RIGHT = -1 # Negative angular velocity turns right
 
 SCAN_THRESHOLD = 0.5 # Metres per second
-PICKUP_DISTANCE = 0.35
  # Array indexes for sensor sectors
 SCAN_FRONT = 0
 SCAN_LEFT = 1
 SCAN_BACK = 2
 SCAN_RIGHT = 3
 
-# Zone positions (example coordinates - adjust based on actual arena)
-ZONES = {
-    'cyan': {'x': -3.0, 'y': 3.0},
-    'purple': {'x': 3.0, 'y': 3.0},
-    'green': {'x': -3.0, 'y': -3.0},
-    'pink': {'x': 3.0, 'y': -3.0}
-}
-
 # Finite state machine (FSM) states
 class State(Enum):
-    FORWARD = 0       # Basic movement state (from week 4/5)
-    TURNING = 1       # Turning to avoid obstacles or explore
-    COLLECTING = 2    # Moving towards and picking up items
-    OFFLOADING = 3    # Depositing items in zones
+    FORWARD = 0
+    TURNING = 1
+    COLLECTING = 2
+    NAVIGATING_TO_ZONE = 3
+    OFFLOADING = 4
+    SPINNING = 5
+    BACKUP = 6
 
 
 class RobotController(Node):
 
     def __init__(self):
         super().__init__('robot_controller')
+        
+        subscriber_callback_group = MutuallyExclusiveCallbackGroup()
+        publisher_callback_group = MutuallyExclusiveCallbackGroup()
+        timer_callback_group = MutuallyExclusiveCallbackGroup()
         
         # Class variables used to store persistent values between executions of callbacks and control loop
         self.state = State.FORWARD # Current FSM state
@@ -82,8 +82,6 @@ class RobotController(Node):
         self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
         self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
         self.items = ItemList()
-        self.current_item = None
-        self.target_zone = None
 
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
@@ -93,7 +91,6 @@ class RobotController(Node):
         # a callback handled by the timer_callback_group. See https://docs.ros.org/en/humble/How-To-Guides/Using-callback-groups.html
         # for a detailed discussion on the ROS executors and callback groups.
         client_callback_group = MutuallyExclusiveCallbackGroup()
-        timer_callback_group = MutuallyExclusiveCallbackGroup()
 
         self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
         self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
@@ -103,14 +100,6 @@ class RobotController(Node):
             'items',
             self.item_callback,
             10, callback_group=timer_callback_group
-        )
-
-        self.holder_subscriber = self.create_subscription(
-            ItemHolder,
-            '/item_holders',
-            self.holder_callback,
-            10,
-            callback_group=timer_callback_group
         )
 
         # Subscribes to Odometry messages published on /odom topic
@@ -147,7 +136,11 @@ class RobotController(Node):
         # 
         # Gazebo ROS differential drive plugin subscribes to these messages, and converts them into left and right wheel speeds
         # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L537-L555
-        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.cmd_vel_publisher = self.create_publisher(
+            Twist, 
+            'cmd_vel', 
+            10, 
+            callback_group=publisher_callback_group)
 
         #self.orientation_publisher = self.create_publisher(Float32, '/orientation', 10)
 
@@ -162,29 +155,41 @@ class RobotController(Node):
 
         # Creates a timer that calls the control_loop method repeatedly - each loop represents single iteration of the FSM
         self.timer_period = 0.1 # 100 milliseconds = 10 Hz
-        self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
+        self.timer = self.create_timer(
+            self.timer_period, 
+            self.control_loop, 
+            callback_group=timer_callback_group)
 
-        # Track zone states internally
-        self.zone_colors = {
-            'cyan': None,
-            'purple': None,
-            'green': None,
-            'pink': None
-        }
-        self.current_zone = None  # Track which zone we're in
+        self.zones = None
+        self.current_zone_target = None
+        self.navigator = BasicNavigator()
+        
+        # Set up nav2
+        initial_pose = PoseStamped()
+        initial_pose.header.frame_id = 'map'
+        initial_pose.header.stamp = self.get_clock().now().to_msg()
+        initial_pose.pose.position.x = 0.0
+        initial_pose.pose.position.y = 0.0
+        initial_pose.pose.orientation.w = 1.0
+        
+        self.navigator.setInitialPose(initial_pose)
+        self.navigator.waitUntilNav2Active()
+        
+        # Add zone subscriber with correct message type
+        self.zone_subscriber = self.create_subscription(
+            ZoneList,
+            'zones',
+            self.zone_callback,
+            10,
+            callback_group=timer_callback_group)
+
+        self.previous_time = self.get_clock().now()
 
     def item_callback(self, msg):
+        if len(msg.data) > 0 and len(self.items.data) == 0:
+            # Only log when we first see an item
+            self.get_logger().info(f'New item detected! Count: {len(msg.data)}')
         self.items = msg
-        if len(msg.data) > 0:
-            self.get_logger().info(f'Items detected: {len(msg.data)}')
-
-    def holder_callback(self, msg):
-        # Track which robot is holding what item
-        for holder in msg.data:
-            if holder.robot_id == self.robot_id:
-                self.current_item = holder.item
-                return
-        self.current_item = None
 
     # Called every time odom_subscriber receives an Odometry message from the /odom topic
     #
@@ -235,91 +240,85 @@ class RobotController(Node):
         self.scan_triggered[SCAN_BACK]  = min(back_ranges)  < SCAN_THRESHOLD
         self.scan_triggered[SCAN_RIGHT] = min(right_ranges) < SCAN_THRESHOLD
 
-    def move_to_pose(self, target_x, target_y):
-        # Check for obstacles first
-        if self.scan_triggered[SCAN_FRONT]:
-            self.get_logger().info('Front obstacle detected while moving to pose')
-            return False
-        
-        if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
-            self.get_logger().info('Side obstacle detected while moving to pose')
-            return False
-        
-        # Calculate distance and angle to target
-        dx = target_x - self.pose.position.x
-        dy = target_y - self.pose.position.y
-        distance = math.sqrt(dx*dx + dy*dy)
-        target_angle = math.atan2(dy, dx)
-        
-        # Calculate angle difference
-        angle_diff = angles.normalize_angle(target_angle - self.yaw)
-        
-        msg = Twist()
-        
-        # If not facing target, turn first
-        if abs(angle_diff) > 0.1:
-            msg.angular.z = ANGULAR_VELOCITY * (1 if angle_diff > 0 else -1)
-        else:
-            # Move towards target
-            msg.linear.x = min(LINEAR_VELOCITY, distance)
-            msg.angular.z = 0.5 * angle_diff  # Proportional control for steering
-            
-        self.cmd_vel_publisher.publish(msg)
-        return distance < 0.1  # Return True if at target
-
-    # Add new method to check if in a zone
-    def check_current_zone(self):
-        for zone_name, pos in ZONES.items():
-            if math.dist((self.pose.position.x, self.pose.position.y), (pos['x'], pos['y'])) < 0.5:
-                return zone_name
-        return None
-
-    def handle_obstacle_avoidance(self):
-        """Handle obstacle avoidance and return True if obstacle detected"""
-        if self.scan_triggered[SCAN_FRONT]:
-            self.get_logger().info('Front obstacle detected, making large turn')
-            self.previous_yaw = self.yaw
-            self.state = State.TURNING
-            self.turn_angle = random.uniform(150, 170)
-            self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-            return True
-        
-        if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
-            self.get_logger().info('Side obstacle detected, turning away')
-            self.previous_yaw = self.yaw
-            self.state = State.TURNING
-            self.turn_angle = random.uniform(45, 90)
-            self.turn_direction = TURN_RIGHT if self.scan_triggered[SCAN_LEFT] else TURN_LEFT
-            return True
-        
-        return False
 
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
-        self.get_logger().info(f'State: {self.state.name}, Has item: {self.current_item is not None}')
+        try:
+            t = self.tf_buffer.lookup_transform(
+                'map',
+                'base_footprint',
+                rclpy.time.Time())
+            
+            self.x = t.transform.translation.x
+            self.y = t.transform.translation.y
+            
+            (roll, pitch, yaw) = euler_from_quaternion([
+                t.transform.rotation.x,
+                t.transform.rotation.y,
+                t.transform.rotation.z,
+                t.transform.rotation.w])
+            
+        except TransformException as e:
+            self.get_logger().info(f"Transform error: {e}")
+            return
+
+        # Add debug info about items near the start of control_loop
+        if len(self.items.data) > 0:
+            item = self.items.data[0]
+            self.get_logger().info(f'Current state: {self.state}, Items in view: {len(self.items.data)}, '
+                                 f'Nearest item at: ({item.x:.2f}, {item.y:.2f})')
+        elif self.state == State.COLLECTING:
+            self.get_logger().info('In COLLECTING state but no items visible!')
+
+        # Send message to rviz_text_marker node
+        marker_input = StringWithPose()
+        marker_input.text = str(self.state) # Visualise robot state as an RViz marker
+        marker_input.pose = self.pose # Set the pose of the RViz marker to track the robot's pose
+        self.marker_publisher.publish(marker_input)
+
+        #self.get_logger().info(f"{self.state}")
         
         match self.state:
+
             case State.FORWARD:
-                self.get_logger().info(f"Moving forward {self.goal_distance:.2f} metres")
+
+                if self.scan_triggered[SCAN_FRONT]:
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = random.uniform(150, 170)
+                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    self.get_logger().info("Detected obstacle in front, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
+                    return
                 
-                # Check for items first
+                if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = 45
+
+                    if self.scan_triggered[SCAN_LEFT] and self.scan_triggered[SCAN_RIGHT]:
+                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                        self.get_logger().info("Detected obstacle to both the left and right, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
+                    elif self.scan_triggered[SCAN_LEFT]:
+                        self.turn_direction = TURN_RIGHT
+                        self.get_logger().info(f"Detected obstacle to the left, turning right by {self.turn_angle} degrees")
+                    else: # self.scan_triggered[SCAN_RIGHT]
+                        self.turn_direction = TURN_LEFT
+                        self.get_logger().info(f"Detected obstacle to the right, turning left by {self.turn_angle} degrees")
+                    return
+                
                 if len(self.items.data) > 0:
                     self.state = State.COLLECTING
                     return
 
-                # Handle obstacle avoidance
-                if self.handle_obstacle_avoidance():
-                    return
-
-                # Forward movement with proper initialization
                 msg = Twist()
                 msg.linear.x = LINEAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
 
-                # In FORWARD state after obstacle check
                 difference_x = self.pose.position.x - self.previous_pose.position.x
                 difference_y = self.pose.position.y - self.previous_pose.position.y
                 distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
+
+                # self.get_logger().info(f"Driven {distance_travelled:.2f} out of {self.goal_distance:.2f} metres")
 
                 if distance_travelled >= self.goal_distance:
                     self.previous_yaw = self.yaw
@@ -327,10 +326,11 @@ class RobotController(Node):
                     self.turn_angle = random.uniform(30, 150)
                     self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
                     self.get_logger().info("Goal reached, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
-                    return
 
             case State.TURNING:
-                self.get_logger().info(f"Turning {self.turn_direction} by {self.turn_angle:.2f} degrees")
+
+                self.get_logger().info("Turning state")
+
                 if len(self.items.data) > 0:
                     self.state = State.COLLECTING
                     return
@@ -339,138 +339,209 @@ class RobotController(Node):
                 msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
 
-                yaw_difference = angles.normalize_angle(self.yaw - self.previous_yaw)
+                # self.get_logger().info(f"Turned {math.degrees(math.fabs(yaw_difference)):.2f} out of {self.turn_angle:.2f} degrees")
+
+                yaw_difference = angles.normalize_angle(self.yaw - self.previous_yaw)                
 
                 if math.fabs(yaw_difference) >= math.radians(self.turn_angle):
                     self.previous_pose = self.pose
-                    self.goal_distance = random.uniform(0.5, 1.0)
+                    self.goal_distance = random.uniform(1.0, 2.0)
                     self.state = State.FORWARD
                     self.get_logger().info(f"Finished turning, driving forward by {self.goal_distance:.2f} metres")
 
             case State.COLLECTING:
                 if len(self.items.data) == 0:
                     self.previous_pose = self.pose
+                    self.goal_distance = random.uniform(1.0, 2.0)
                     self.state = State.FORWARD
                     return
+                
+                # Choose the closest item based on diameter (larger diameter = closer)
+                closest_item = max(self.items.data, key=lambda x: x.diameter)
+                msg = Twist()
 
-                item = self.items.data[0]
-                estimated_distance = 32.4 * float(item.diameter) ** -0.75
-                self.get_logger().info(f"Collecting item at distance {estimated_distance:.2f}")
+                # x is left/right in camera view (negative is right)
+                # y is up/down in camera view (negative is down)
+                angle_to_item = closest_item.x / 320.0  # Convert pixel x to normalized angle
+                estimated_distance = 32.4 * float(closest_item.diameter) ** -0.75
+                
+                self.get_logger().info(f'Item detected - Distance: {estimated_distance:.2f}m, Angle: {math.degrees(angle_to_item):.2f}°')
 
-                if estimated_distance <= PICKUP_DISTANCE:
-                    request = ItemRequest.Request()
-                    request.robot_id = self.robot_id
+                if estimated_distance < 0.35:  # DISTANCE from item_manager.py
+                    msg.linear.x = 0.0
+                    msg.angular.z = 0.0
+                    self.cmd_vel_publisher.publish(msg)
+                    
+                    rqt = ItemRequest.Request()
+                    rqt.robot_id = self.robot_id
                     try:
-                        future = self.pick_up_service.call_async(request)
+                        future = self.pick_up_service.call_async(rqt)
                         rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
-                            self.get_logger().info('Item picked up')
-                            self.current_item = item
-                            self.items.data = []  # Clear items list since we picked it up
-                            self.state = State.OFFLOADING
-                            return  # Important to return here to start offloading immediately
+                            self.get_logger().info('Successfully picked up item!')
+                            self.state = State.NAVIGATING_TO_ZONE
                         else:
-                            self.get_logger().info('Unable to pick up item: ' + response.message)
-                            # Move away slightly and try again
-                            self.previous_pose = self.pose
-                            self.goal_distance = random.uniform(0.5, 1.0)
-                            self.state = State.FORWARD
+                            self.get_logger().info('Failed to pick up item: ' + response.message)
+                            msg.linear.x = 0.05
+                            self.cmd_vel_publisher.publish(msg)
                     except Exception as e:
-                        self.get_logger().error(f'Service call failed: {str(e)}')
-                        self.state = State.FORWARD
-                        return
-
-                msg = Twist()
-                msg.linear.x = 0.25 * estimated_distance
-                msg.angular.z = item.x / 320.0
-                self.cmd_vel_publisher.publish(msg)
-                return
+                        self.get_logger().info(f'Service call failed: {str(e)}')
+                else:
+                    msg.linear.x = 0.25 * estimated_distance
+                    msg.angular.z = angle_to_item
+                    self.cmd_vel_publisher.publish(msg)
 
             case State.OFFLOADING:
-                if not self.current_item:
-                    self.get_logger().info('No item held, returning to FORWARD')
-                    self.state = State.FORWARD
+                # Try to offload the item
+                rqt = ItemRequest.Request()
+                rqt.robot_id = self.robot_id
+                try:
+                    future = self.offload_service.call_async(rqt)
+                    rclpy.spin_until_future_complete(self, future)
+                    response = future.result()
+                    if response.success:
+                        self.get_logger().info('Successfully offloaded item: ' + response.message)
+                        self.previous_pose = self.pose
+                        self.goal_distance = random.uniform(1.0, 2.0)
+                        self.state = State.FORWARD
+                    else:
+                        self.get_logger().info('Failed to offload item: ' + response.message)
+                        self.current_zone_target = None
+                        self.state = State.NAVIGATING_TO_ZONE
+                except Exception as e:
+                    self.get_logger().info(f'Service call failed: {str(e)}')
+            case State.NAVIGATING_TO_ZONE:
+                time_difference = self.get_clock().now() - self.previous_time
+                if time_difference > Duration(seconds=300):
+                    self.navigator.cancelTask()
+                    self.previous_time = self.get_clock().now()
+                    self.get_logger().info(f"Navigation timeout, cancelling...")
+                    self.current_zone_target = None
                     return
 
-                # Check if we're already in a zone
-                self.current_zone = self.check_current_zone()
+                if self.zones is None or len(self.zones) == 0:
+                    self.get_logger().info('No zones detected, continuing to search...')
+                    return
                 
-                if self.current_zone:
-                    zone_color = self.zone_colors[self.current_zone]
-                    if zone_color is None or zone_color == self.current_item.colour:
-                        request = ItemRequest.Request()
-                        request.robot_id = self.robot_id
-                        try:
-                            future = self.offload_service.call_async(request)
-                            rclpy.spin_until_future_complete(self, future)
-                            response = future.result()
-                            if response.success:
-                                self.get_logger().info(f'Successfully offloaded item in {self.current_zone} zone')
-                                # Only update zone color if this was a successful deposit
-                                if 'deposited' in response.message.lower():
-                                    if self.zone_colors[self.current_zone] is None:
-                                        self.zone_colors[self.current_zone] = self.current_item.colour
-                                        self.get_logger().info(f'Zone {self.current_zone} now accepts {self.current_item.colour} items')
-                            else:
-                                # Item was offloaded but not deposited
-                                self.get_logger().info(f'Failed to deposit in {self.current_zone} zone: {response.message}')
-                                self.state = State.FORWARD
-                        except Exception as e:
-                            self.get_logger().error(f'Service call failed: {str(e)}')
-                            self.state = State.FORWARD
-                        return
+                if not self.current_zone_target:
+                    # Pick a random zone to try
+                    self.current_zone_target = random.choice(self.zones)
+                    
+                    goal_pose = PoseStamped()
+                    goal_pose.header.frame_id = 'map'
+                    goal_pose.header.stamp = self.get_clock().now().to_msg()
+                    goal_pose.pose.position.x = self.current_zone_target.x
+                    goal_pose.pose.position.y = self.current_zone_target.y
+                    
+                    # Set orientation using quaternion
+                    angle = random.uniform(-180, 180)
+                    (goal_pose.pose.orientation.x,
+                     goal_pose.pose.orientation.y,
+                     goal_pose.pose.orientation.z,
+                     goal_pose.pose.orientation.w) = quaternion_from_euler(0, 0, math.radians(angle), axes='sxyz')
+                    
+                    self.get_logger().info(f'Navigating to zone at ({goal_pose.pose.position.x:.2f}, {goal_pose.pose.position.y:.2f})')
+                    self.navigator.goToPose(goal_pose)
                 
-                # Find and move to suitable zone
-                target_zone = None
-                blocked_attempts = 0  # Track failed attempts
-
-                # Try each zone until we find one we can reach
-                for zone_name, color in self.zone_colors.items():
-                    if color is None or color == self.current_item.colour:
-                        target_zone = zone_name
-                        self.get_logger().info(f'Attempting to move to {zone_name} zone')
+                if not self.navigator.isTaskComplete():
+                    feedback = self.navigator.getFeedback()
+                    self.get_logger().info(f'Distance remaining: {feedback.distance_remaining:.2f}m')
+                    
+                    # Add timeout handling
+                    if Duration.from_msg(feedback.navigation_time) > Duration(seconds=30):
+                        self.get_logger().info('Navigation took too long... cancelling')
+                        self.navigator.cancelTask()
+                        self.current_zone_target = None
+                else:
+                    result = self.navigator.getResult()
+                    
+                    match result:
+                        case TaskResult.SUCCEEDED:
+                            self.get_logger().info('Reached zone, spinning to align')
+                            self.navigator.spin(spin_dist=math.radians(180), time_allowance=10)
+                            self.state = State.SPINNING
                         
-                        # Add obstacle avoidance before move_to_pose
-                        if self.handle_obstacle_avoidance():
-                            return
-
-                        # Try to move to this zone
-                        if self.move_to_pose(ZONES[target_zone]['x'], ZONES[target_zone]['y']):
-                            self.get_logger().info(f'Successfully reached {zone_name} zone')
-                            return
+                        case TaskResult.CANCELED:
+                            self.get_logger().info('Navigation was canceled!')
+                            self.current_zone_target = None
+                            self.state = State.NAVIGATING_TO_ZONE
                         
-                        # If blocked by obstacles, try another zone after some attempts
-                        blocked_attempts += 1
-                        if blocked_attempts >= 3:  # Try each zone up to 3 times
-                            self.get_logger().info(f'Zone {zone_name} appears blocked, trying another')
-                            continue
-
-                if not target_zone:
-                    self.get_logger().info('No suitable zones found, offloading in current location')
-                    request = ItemRequest.Request()
-                    request.robot_id = self.robot_id
-                    try:
-                        future = self.offload_service.call_async(request)
-                        rclpy.spin_until_future_complete(self, future)
-                        response = future.result()
-                        if response.success:
-                            self.get_logger().info('Item offloaded in current location')
-                        self.state = State.FORWARD  # Always transition to FORWARD after offloading attempt
-                        return
-                    except Exception as e:
-                        self.get_logger().error(f'Service call failed: {str(e)}')
-                        self.state = State.FORWARD  # Ensure state transition on error
-                        return
-
-                self.state = State.FORWARD
-
+                        case TaskResult.FAILED:
+                            self.get_logger().info('Navigation failed!')
+                            self.current_zone_target = None
+                            self.state = State.NAVIGATING_TO_ZONE
+                        
+                        case _:
+                            self.get_logger().info('Navigation has an invalid return status!')
+                            self.current_zone_target = None
+            case State.SPINNING:
+                if not self.navigator.isTaskComplete():
+                    feedback = self.navigator.getFeedback()
+                    self.get_logger().info(f"Turned: {math.degrees(feedback.angular_distance_traveled):.2f} degrees")
+                else:
+                    result = self.navigator.getResult()
+                    
+                    match result:
+                        case TaskResult.SUCCEEDED:
+                            self.get_logger().info(f"Spin succeeded, backing up")
+                            self.navigator.backup(backup_dist=0.15, backup_speed=0.025, time_allowance=10)
+                            self.state = State.BACKUP
+                        
+                        case TaskResult.CANCELED:
+                            self.get_logger().info(f"Spin was canceled!")
+                            self.current_zone_target = None
+                            self.state = State.NAVIGATING_TO_ZONE
+                        
+                        case TaskResult.FAILED:
+                            self.get_logger().info(f"Spin failed!")
+                            self.current_zone_target = None
+                            self.state = State.NAVIGATING_TO_ZONE
+                        
+                        case _:
+                            self.get_logger().info(f"Spin has an invalid return status!")
+                            self.current_zone_target = None
+            case State.BACKUP:
+                if not self.navigator.isTaskComplete():
+                    feedback = self.navigator.getFeedback()
+                    self.get_logger().info(f"Distance travelled: {feedback.distance_traveled:.2f} metres")
+                else:
+                    result = self.navigator.getResult()
+                    
+                    match result:
+                        case TaskResult.SUCCEEDED:
+                            self.get_logger().info(f"Backup succeeded, attempting offload")
+                            self.state = State.OFFLOADING
+                        
+                        case TaskResult.CANCELED:
+                            self.get_logger().info(f"Backup was canceled!")
+                            self.current_zone_target = None
+                            self.state = State.NAVIGATING_TO_ZONE
+                        
+                        case TaskResult.FAILED:
+                            self.get_logger().info(f"Backup failed!")
+                            self.current_zone_target = None
+                            self.state = State.NAVIGATING_TO_ZONE
+                        
+                        case _:
+                            self.get_logger().info(f"Backup has an invalid return status!")
+                            self.current_zone_target = None
+            case _:
+                pass
+        
     def destroy_node(self):
         msg = Twist()
         self.cmd_vel_publisher.publish(msg)
         self.get_logger().info(f"Stopping: {msg}")
+        self.navigator.lifecycleShutdown()
         super().destroy_node()
 
+    def zone_callback(self, msg):
+        self.zones = msg.data
+        if len(self.zones) > 0:
+            self.get_logger().info(f'Zones detected: {len(self.zones)}')
+            for zone in self.zones:
+                self.get_logger().info(f'Zone at ({zone.x}, {zone.y})')
 
 def main(args=None):
 
