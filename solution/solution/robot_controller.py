@@ -277,7 +277,12 @@ class RobotController(Node):
                             self.get_logger().info('Item picked up.')
                             self.holding_item = True
                             self.held_item_color = item.colour
-                            self.state = State.FORWARD
+                            # Change state to FORWARD to immediately check for zones
+                            suitable_zone = self.find_suitable_zone()
+                            if suitable_zone:
+                                self.state = State.DEPOSITING
+                            else:
+                                self.state = State.FORWARD
                             self.items.data = []
                         else:
                             self.get_logger().info('Unable to pick up item: ' + response.message)
@@ -296,6 +301,9 @@ class RobotController(Node):
                     self.state = State.FORWARD
                     return
 
+                # Log navigation attempt
+                self.get_logger().info(f'Navigating to zone at ({suitable_zone.x}, {suitable_zone.y})')
+                
                 if self.navigate_to_target(suitable_zone.x, suitable_zone.y, ZONE_DEPOSIT_DISTANCE):
                     request = ItemRequest.Request()
                     request.robot_id = self.robot_id
@@ -304,6 +312,7 @@ class RobotController(Node):
                         rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
+                            self.get_logger().info('Successfully deposited item in zone')
                             self.holding_item = False
                             self.held_item_color = None
                         else:
