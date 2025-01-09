@@ -1,15 +1,23 @@
+import sys
 import rclpy
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
+from rclpy.executors import ExternalShutdownException
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.qos import QoSPresetProfiles
+from enum import Enum
 
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, Pose
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from assessment_interfaces.msg import ItemList, ZoneList
 from auro_interfaces.srv import ItemRequest
+from auro_interfaces.msg import StringWithPose
 
+from tf_transformations import euler_from_quaternion
+import angles
 import random
-from enum import Enum
+import math
 
 # Constants for movement
 LINEAR_VELOCITY = 0.3
@@ -36,6 +44,7 @@ class State(Enum):
     SEARCHING = 0  # Looking for items or zones
     COLLECTING = 1 # Moving to collect an item
     DEPOSITING = 2 # Moving to deposit in a zone
+    ROTATING = 3   # Rotating to find zones
 
 class RobotController(Node):
     def __init__(self):
@@ -43,6 +52,9 @@ class RobotController(Node):
         
         # Robot state
         self.state = State.SEARCHING
+        self.pose = Pose()
+        self.yaw = 0.0
+        self.previous_yaw = 0.0
         self.scan_triggered = [False] * 4
         
         # Item and zone tracking
@@ -88,6 +100,14 @@ class RobotController(Node):
             callback_group=timer_cb_group
         )
         
+        self.odom_subscriber = self.create_subscription(
+            Odometry,
+            'odom',
+            self.odom_callback,
+            10,
+            callback_group=timer_cb_group
+        )
+        
         self.scan_subscriber = self.create_subscription(
             LaserScan,
             'scan',
@@ -96,10 +116,16 @@ class RobotController(Node):
             callback_group=timer_cb_group
         )
 
-        # Publisher
+        # Publishers
         self.cmd_vel_publisher = self.create_publisher(
             Twist, 
             'cmd_vel', 
+            10
+        )
+        
+        self.marker_publisher = self.create_publisher(
+            StringWithPose, 
+            'marker_input', 
             10
         )
 
@@ -115,6 +141,15 @@ class RobotController(Node):
 
     def zone_callback(self, msg):
         self.zones = msg
+
+    def odom_callback(self, msg):
+        self.pose = msg.pose.pose
+        (_, _, self.yaw) = euler_from_quaternion([
+            self.pose.orientation.x,
+            self.pose.orientation.y,
+            self.pose.orientation.z,
+            self.pose.orientation.w
+        ])
 
     def scan_callback(self, msg):
         front_ranges = msg.ranges[331:359] + msg.ranges[0:30]
@@ -163,7 +198,19 @@ class RobotController(Node):
         # Return True if we're close enough (based on size)
         return size > 0.2
 
+    def rotate_in_place(self):
+        """Rotate the robot in place at a constant speed"""
+        msg = Twist()
+        msg.angular.z = ANGULAR_VELOCITY
+        self.cmd_vel_publisher.publish(msg)
+
     def control_loop(self):
+        # Update marker for visualization
+        marker = StringWithPose()
+        marker.text = str(self.state)
+        marker.pose = self.pose
+        self.marker_publisher.publish(marker)
+
         self.get_logger().info(f"STATE: {self.state}, Holding: {self.held_item_color if self.holding_item else 'No'}")
         
         match self.state:
@@ -173,19 +220,10 @@ class RobotController(Node):
                     self.state = State.COLLECTING
                     return
                     
-                # If holding an item, turn in place until we find a zone
+                # If holding an item, switch to rotating to find a zone
                 if self.holding_item:
-                    suitable_zone = self.find_suitable_zone()
-                    if suitable_zone:
-                        self.state = State.DEPOSITING
-                        self.get_logger().info(f'Found {ZONE_COLORS.get(suitable_zone.zone, "unknown")} zone, moving to deposit')
-                        return
-                    else:
-                        # Turn in place to search for zones
-                        msg = Twist()
-                        msg.angular.z = ANGULAR_VELOCITY
-                        self.cmd_vel_publisher.publish(msg)
-                        return
+                    self.state = State.ROTATING
+                    return
 
                 # If not holding an item and no item visible, explore
                 if self.scan_triggered[SCAN_FRONT]:
@@ -196,6 +234,16 @@ class RobotController(Node):
                     msg = Twist()
                     msg.linear.x = LINEAR_VELOCITY
                     self.cmd_vel_publisher.publish(msg)
+
+            case State.ROTATING:
+                # Keep rotating until we find a suitable zone
+                suitable_zone = self.find_suitable_zone()
+                if suitable_zone:
+                    self.state = State.DEPOSITING
+                    self.get_logger().info(f'Found {ZONE_COLORS.get(suitable_zone.zone, "unknown")} zone, moving to deposit')
+                    return
+                else:
+                    self.rotate_in_place()
 
             case State.COLLECTING:
                 if len(self.items.data) == 0:
@@ -215,7 +263,7 @@ class RobotController(Node):
                             self.get_logger().info(f'Picked up {item.colour} item')
                             self.holding_item = True
                             self.held_item_color = item.colour
-                            self.state = State.SEARCHING
+                            self.state = State.ROTATING
                         else:
                             self.get_logger().info('Failed to pick up: ' + response.message)
                     except Exception as e:
@@ -224,7 +272,7 @@ class RobotController(Node):
             case State.DEPOSITING:
                 suitable_zone = self.find_suitable_zone()
                 if not suitable_zone:
-                    self.state = State.SEARCHING
+                    self.state = State.ROTATING
                     return
 
                 if self.move_to_target(suitable_zone.x, suitable_zone.y, suitable_zone.size):
@@ -239,22 +287,26 @@ class RobotController(Node):
                             self.get_logger().info(f'Deposited {self.held_item_color} item in {ZONE_COLORS.get(suitable_zone.zone, "unknown")} zone')
                             self.holding_item = False
                             self.held_item_color = None
+                            self.state = State.SEARCHING
                         else:
                             self.get_logger().warn(f'Failed to deposit: {response.message}')
+                            self.state = State.ROTATING
                     except Exception as e:
                         self.get_logger().error(f'Service call failed: {e}')
-                    self.state = State.SEARCHING
+                        self.state = State.ROTATING
 
 def main(args=None):
-    rclpy.init(args=args)
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = RobotController()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except ExternalShutdownException:
+        sys.exit(1)
     finally:
         # Stop the robot before shutting down
         msg = Twist()
         node.cmd_vel_publisher.publish(msg)
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
