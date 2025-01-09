@@ -245,8 +245,11 @@ class RobotController(Node):
                     self.state = State.DEPOSITING
                     self.get_logger().info(f'Found {ZONE_COLORS.get(suitable_zone.zone, "unknown")} zone, moving to deposit')
                     return
-                else:
-                    self.rotate_in_place()
+                
+                # Just rotate in place
+                msg = Twist()
+                msg.angular.z = ANGULAR_VELOCITY
+                self.cmd_vel_publisher.publish(msg)
 
             case State.COLLECTING:
                 if len(self.items.data) == 0:
@@ -289,13 +292,13 @@ class RobotController(Node):
                     self.state = State.ROTATING
                     return
 
-                # Use the same visual servoing approach as item collection
+                # Navigate to zone exactly like we do for items
                 msg = Twist()
-                msg.linear.x = 0.25 * (1.0 - suitable_zone.size)  # Move slower as we get closer
-                msg.angular.z = suitable_zone.x / 320.0  # Turn based on zone position in image
+                msg.linear.x = 0.25 * (1.0 - suitable_zone.size)  # Slow down as we get closer
+                msg.angular.z = suitable_zone.x / 320.0  # Center the zone in view
                 self.cmd_vel_publisher.publish(msg)
 
-                # Check if we're close enough to deposit
+                # Try to deposit when zone is large enough in view
                 if suitable_zone.size >= ZONE_DEPOSIT_DISTANCE:
                     request = ItemRequest.Request()
                     request.robot_id = self.robot_id
