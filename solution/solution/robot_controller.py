@@ -207,7 +207,17 @@ class RobotController(Node):
         return None
 
     def navigate_to_target(self, x, y, close_distance):
+        """Navigate using camera-relative coordinates (x, y)
+        x: pixels from center of image (positive is left)
+        y: pixels from center of image (positive is up)
+        """
         try:
+            # If we can't see the zone anymore, stop
+            if not self.zones.data:
+                msg = Twist()
+                self.cmd_vel_publisher.publish(msg)
+                return False
+
             # First check if there's an obstacle in front
             if self.scan_triggered[SCAN_FRONT]:
                 msg = Twist()
@@ -215,57 +225,33 @@ class RobotController(Node):
                 self.cmd_vel_publisher.publish(msg)
                 return False
 
-            # Get the transform from base_link to odom
-            t = self.tf_buffer.lookup_transform(
-                'odom',
-                'base_link',
-                rclpy.time.Time())
-            
-            # Get robot's current position from transform
-            robot_x = t.transform.translation.x
-            robot_y = t.transform.translation.y
-            
-            # Calculate distance and angle to target
-            x_to_target = x - robot_x
-            y_to_target = y - robot_y
-            
-            distance = math.sqrt(x_to_target ** 2 + y_to_target ** 2)
-            target_angle = math.atan2(y_to_target, x_to_target)
-            
-            # Get current robot orientation
-            (_, _, current_yaw) = euler_from_quaternion([
-                t.transform.rotation.x,
-                t.transform.rotation.y,
-                t.transform.rotation.z,
-                t.transform.rotation.w
-            ])
-            
-            # Calculate the angle difference
-            angle_diff = angles.normalize_angle(target_angle - current_yaw)
-
-            self.get_logger().info(f'Distance: {distance:.2f}, Angle diff: {math.degrees(angle_diff):.2f} degrees')
-
-            if distance < close_distance:
-                msg = Twist()
-                self.cmd_vel_publisher.publish(msg)
-                return True
-
             msg = Twist()
             
-            # If we're not facing the right direction, turn first
-            if abs(angle_diff) > math.pi/6:  # 30 degrees
-                msg.angular.z = 0.3 * angle_diff
-                msg.linear.x = 0.0
+            # x is negative when target is to the right
+            # Scale down the angular velocity for smoother motion
+            msg.angular.z = -0.003 * x
+
+            # y is negative when target is down/forward
+            # Only move forward if roughly aligned
+            if abs(x) < 100:  # Within ~100 pixels of center
+                # Scale down the linear velocity for smoother motion
+                # Negative y means move forward
+                msg.linear.x = -0.002 * y
+                msg.linear.x = min(0.2, max(msg.linear.x, 0))  # Cap between 0 and 0.2
             else:
-                # Move forward while making small angle corrections
-                msg.linear.x = min(0.2, 0.3 * distance)  # Cap forward speed
-                msg.angular.z = 0.2 * angle_diff
+                msg.linear.x = 0.0
 
             self.cmd_vel_publisher.publish(msg)
+
+            # Consider we've reached the target if we're close enough (based on size)
+            for zone in self.zones.data:
+                if zone.size > 0.2:  # Adjust this threshold as needed
+                    return True
+            
             return False
 
-        except TransformException as e:
-            self.get_logger().error(f'Transform error: {e}')
+        except Exception as e:
+            self.get_logger().error(f'Navigation error: {e}')
             return False
 
     def control_loop(self):
