@@ -296,7 +296,7 @@ class RobotController(Node):
 
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
-        self.get_logger().info(f'State: {self.state.name}')
+        self.get_logger().info(f'State: {self.state.name}, Has item: {self.current_item is not None}')
         
         match self.state:
             case State.FORWARD:
@@ -307,33 +307,14 @@ class RobotController(Node):
                     self.state = State.COLLECTING
                     return
 
-                # Handle obstacle detection and movement
-                msg = Twist()
-                if self.scan_triggered[SCAN_FRONT]:
-                    msg.linear.x = 0.0
-                    self.cmd_vel_publisher.publish(msg)
-                    self.previous_yaw = self.yaw
-                    self.state = State.TURNING
-                    self.turn_angle = random.uniform(150, 170)  # Larger turn angle for front obstacles
-                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                    return
-                
-                if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
-                    msg.linear.x = 0.0
-                    self.cmd_vel_publisher.publish(msg)
-                    self.previous_yaw = self.yaw
-                    self.state = State.TURNING
-                    self.turn_angle = random.uniform(45, 90)
-                    self.turn_direction = TURN_RIGHT if self.scan_triggered[SCAN_LEFT] else TURN_LEFT
-                    return
-
-                # Forward movement
-                msg.linear.x = LINEAR_VELOCITY
-                self.cmd_vel_publisher.publish(msg)
-
-                # In FORWARD state
+                # Handle obstacle avoidance
                 if self.handle_obstacle_avoidance():
                     return
+
+                # Forward movement with proper initialization
+                msg = Twist()
+                msg.linear.x = LINEAR_VELOCITY
+                self.cmd_vel_publisher.publish(msg)
 
                 # In FORWARD state after obstacle check
                 difference_x = self.pose.position.x - self.previous_pose.position.x
@@ -386,7 +367,9 @@ class RobotController(Node):
                         if response.success:
                             self.get_logger().info('Item picked up')
                             self.current_item = item
+                            self.items.data = []  # Clear items list since we picked it up
                             self.state = State.OFFLOADING
+                            return  # Important to return here to start offloading immediately
                         else:
                             self.get_logger().info('Unable to pick up item: ' + response.message)
                             # Move away slightly and try again
@@ -448,41 +431,23 @@ class RobotController(Node):
                         target_zone = zone_name
                         self.get_logger().info(f'Attempting to move to {zone_name} zone')
                         
-                        # Try to move to this zone
-                        if self.move_to_pose(ZONES[target_zone]['x'], ZONES[target_zone]['y']):
-                            return
-                        
-                        # If blocked by obstacles, try another zone
-                        blocked_attempts += 1
-                        if blocked_attempts >= len(ZONES):
-                            self.get_logger().info('All zones blocked, offloading item in current location')
-                            request = ItemRequest.Request()
-                            request.robot_id = self.robot_id
-                            try:
-                                future = self.offload_service.call_async(request)
-                                rclpy.spin_until_future_complete(self, future)
-                                response = future.result()
-                                if response.success:
-                                    self.get_logger().info('Item offloaded in current location')
-                                    self.state = State.FORWARD
-                                else:
-                                    self.get_logger().error('Offload failed: ' + response.message)
-                                    self.state = State.FORWARD
-                            except Exception as e:
-                                self.get_logger().error(f'Offload failed: {str(e)}')
-                                self.state = State.FORWARD
+                        # Add obstacle avoidance before move_to_pose
+                        if self.handle_obstacle_avoidance():
                             return
 
-                if target_zone:
-                    # More aggressive obstacle avoidance
-                    if self.handle_obstacle_avoidance():
-                        return
-                    
-                    if self.move_to_pose(ZONES[target_zone]['x'], ZONES[target_zone]['y']):
-                        return
-                else:
-                    # No suitable zone, offload item where we are
-                    self.get_logger().info('No suitable zone found, offloading item in current location')
+                        # Try to move to this zone
+                        if self.move_to_pose(ZONES[target_zone]['x'], ZONES[target_zone]['y']):
+                            self.get_logger().info(f'Successfully reached {zone_name} zone')
+                            return
+                        
+                        # If blocked by obstacles, try another zone after some attempts
+                        blocked_attempts += 1
+                        if blocked_attempts >= 3:  # Try each zone up to 3 times
+                            self.get_logger().info(f'Zone {zone_name} appears blocked, trying another')
+                            continue
+
+                if not target_zone:
+                    self.get_logger().info('No suitable zones found, offloading in current location')
                     request = ItemRequest.Request()
                     request.robot_id = self.robot_id
                     try:
@@ -491,9 +456,13 @@ class RobotController(Node):
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Item offloaded in current location')
+                        self.state = State.FORWARD  # Always transition to FORWARD after offloading attempt
+                        return
                     except Exception as e:
                         self.get_logger().error(f'Service call failed: {str(e)}')
-                    
+                        self.state = State.FORWARD  # Ensure state transition on error
+                        return
+
                 self.state = State.FORWARD
 
     def destroy_node(self):
