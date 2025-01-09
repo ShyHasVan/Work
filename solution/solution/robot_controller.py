@@ -6,7 +6,7 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.qos import QoSPresetProfiles
 
-from geometry_msgs.msg import Twist, Pose
+from geometry_msgs.msg import Twist, Pose, PoseStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from assessment_interfaces.msg import ItemList, ZoneList
@@ -35,8 +35,6 @@ SCAN_BACK = 2
 SCAN_RIGHT = 3
 
 # Navigation constants
-ROAMING_RADIUS = 2.0
-HOME_RADIUS = 0.5
 ITEM_PICKUP_DISTANCE = 0.35
 ZONE_DEPOSIT_DISTANCE = 0.5
 
@@ -44,12 +42,20 @@ class State(Enum):
     FORWARD = 0
     TURNING = 1
     COLLECTING = 2
-    RETURNING = 3
-    DEPOSITING = 4
+    DEPOSITING = 3
 
 class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
+        
+        # Initial pose parameters
+        self.declare_parameter('x', 0.0)
+        self.declare_parameter('y', 0.0)
+        self.declare_parameter('yaw', 0.0)
+        
+        self.initial_x = self.get_parameter('x').value
+        self.initial_y = self.get_parameter('y').value
+        self.initial_yaw = self.get_parameter('yaw').value
         
         # Robot state
         self.state = State.FORWARD
@@ -69,20 +75,16 @@ class RobotController(Node):
         # Navigation
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.x_to_target = 0.0
-        self.y_to_target = 0.0
-        self.distance_to_target = 0.0
-        self.angle_to_target = 0.0
         
         # Robot ID parameter
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
 
-        # Callback groups for service calls
+        # Callback groups
         client_cb_group = MutuallyExclusiveCallbackGroup()
         timer_cb_group = MutuallyExclusiveCallbackGroup()
 
-        # Services
+        # Services (using absolute paths due to namespacing)
         self.pick_up_service = self.create_client(
             ItemRequest, 
             '/pick_up_item',
@@ -94,7 +96,7 @@ class RobotController(Node):
             callback_group=client_cb_group
         )
 
-        # Subscribers
+        # Subscribers (using relative paths due to namespacing)
         self.item_subscriber = self.create_subscription(
             ItemList,
             'items',
@@ -105,7 +107,7 @@ class RobotController(Node):
         
         self.zone_subscriber = self.create_subscription(
             ZoneList,
-            'zone',
+            'zones',
             self.zone_callback,
             10,
             callback_group=timer_cb_group
@@ -135,9 +137,8 @@ class RobotController(Node):
         )
 
         # Control loop timer
-        self.timer_period = 0.1
         self.timer = self.create_timer(
-            self.timer_period, 
+            0.1, 
             self.control_loop,
             callback_group=timer_cb_group
         )
@@ -250,11 +251,14 @@ class RobotController(Node):
 
             case State.COLLECTING:
                 if len(self.items.data) == 0:
+                    self.previous_pose = self.pose
                     self.state = State.FORWARD
                     return
-
+                
                 item = self.items.data[0]
                 estimated_distance = 32.4 * float(item.diameter) ** -0.75
+
+                self.get_logger().info(f'Estimated distance {estimated_distance}')
 
                 if estimated_distance <= ITEM_PICKUP_DISTANCE:
                     request = ItemRequest.Request()
@@ -264,11 +268,13 @@ class RobotController(Node):
                         rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
+                            self.get_logger().info('Item picked up.')
                             self.holding_item = True
                             self.held_item_color = item.colour
                             self.state = State.FORWARD
+                            self.items.data = []
                         else:
-                            self.get_logger().warn(f'Failed to pick up: {response.message}')
+                            self.get_logger().info('Unable to pick up item: ' + response.message)
                     except Exception as e:
                         self.get_logger().error(f'Service call failed: {e}')
                     return
@@ -307,11 +313,10 @@ class RobotController(Node):
 
 
 def main(args=None):
-
-    rclpy.init(args = args, signal_handler_options = SignalHandlerOptions.NO)
-
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    
     node = RobotController()
-
+    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
