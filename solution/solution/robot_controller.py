@@ -20,6 +20,7 @@ from tf_transformations import euler_from_quaternion
 import angles
 import random
 import math
+from enum import Enum
 
 # Constants for movement
 LINEAR_VELOCITY = 0.3
