@@ -208,33 +208,59 @@ class RobotController(Node):
 
     def navigate_to_target(self, x, y, close_distance):
         try:
+            # First check if there's an obstacle in front
+            if self.scan_triggered[SCAN_FRONT]:
+                msg = Twist()
+                msg.angular.z = TURN_LEFT * ANGULAR_VELOCITY
+                self.cmd_vel_publisher.publish(msg)
+                return False
+
+            # Get the transform from base_link to odom
             t = self.tf_buffer.lookup_transform(
-                'base_link',
                 'odom',
+                'base_link',
                 rclpy.time.Time())
             
-            # Transform target coordinates to robot's frame
-            x_to_target = x - self.pose.position.x
-            y_to_target = y - self.pose.position.y
+            # Get robot's current position from transform
+            robot_x = t.transform.translation.x
+            robot_y = t.transform.translation.y
             
-            # Convert to robot's frame
-            angle = math.atan2(y_to_target, x_to_target) - self.yaw
+            # Calculate distance and angle to target
+            x_to_target = x - robot_x
+            y_to_target = y - robot_y
+            
             distance = math.sqrt(x_to_target ** 2 + y_to_target ** 2)
+            target_angle = math.atan2(y_to_target, x_to_target)
             
-            # Normalize angle to [-pi, pi]
-            angle = angles.normalize_angle(angle)
+            # Get current robot orientation
+            (_, _, current_yaw) = euler_from_quaternion([
+                t.transform.rotation.x,
+                t.transform.rotation.y,
+                t.transform.rotation.z,
+                t.transform.rotation.w
+            ])
+            
+            # Calculate the angle difference
+            angle_diff = angles.normalize_angle(target_angle - current_yaw)
+
+            self.get_logger().info(f'Distance: {distance:.2f}, Angle diff: {math.degrees(angle_diff):.2f} degrees')
 
             if distance < close_distance:
+                msg = Twist()
+                self.cmd_vel_publisher.publish(msg)
                 return True
 
             msg = Twist()
-            # Scale angular velocity based on angle difference
-            msg.angular.z = 0.5 * angle
-            # Only move forward if roughly facing the target
-            if abs(angle) < math.pi/4:  # 45 degrees
-                msg.linear.x = 0.25 * distance
-            else:
+            
+            # If we're not facing the right direction, turn first
+            if abs(angle_diff) > math.pi/6:  # 30 degrees
+                msg.angular.z = 0.3 * angle_diff
                 msg.linear.x = 0.0
+            else:
+                # Move forward while making small angle corrections
+                msg.linear.x = min(0.2, 0.3 * distance)  # Cap forward speed
+                msg.angular.z = 0.2 * angle_diff
+
             self.cmd_vel_publisher.publish(msg)
             return False
 
