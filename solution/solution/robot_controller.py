@@ -26,12 +26,13 @@ from std_msgs.msg import Float32
 from geometry_msgs.msg import Twist, Pose, PoseStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from assessment_interfaces.msg import Item, ItemList, ZoneList, Zone
+from assessment_interfaces.msg import Item, ItemList, Zone, ZoneList
 from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
+
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 
-from tf_transformations import euler_from_quaternion
+from tf_transformations import euler_from_quaternion, quaternion_from_euler
 import angles
 
 from enum import Enum
@@ -58,18 +59,12 @@ class State(Enum):
     COLLECTING = 2
     NAVIGATING_TO_ZONE = 3
     OFFLOADING = 4
-    SPINNING = 5
-    BACKUP = 6
 
 
 class RobotController(Node):
 
     def __init__(self):
         super().__init__('robot_controller')
-        
-        subscriber_callback_group = MutuallyExclusiveCallbackGroup()
-        publisher_callback_group = MutuallyExclusiveCallbackGroup()
-        timer_callback_group = MutuallyExclusiveCallbackGroup()
         
         # Class variables used to store persistent values between executions of callbacks and control loop
         self.state = State.FORWARD # Current FSM state
@@ -91,6 +86,7 @@ class RobotController(Node):
         # a callback handled by the timer_callback_group. See https://docs.ros.org/en/humble/How-To-Guides/Using-callback-groups.html
         # for a detailed discussion on the ROS executors and callback groups.
         client_callback_group = MutuallyExclusiveCallbackGroup()
+        timer_callback_group = MutuallyExclusiveCallbackGroup()
 
         self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
         self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
@@ -136,11 +132,7 @@ class RobotController(Node):
         # 
         # Gazebo ROS differential drive plugin subscribes to these messages, and converts them into left and right wheel speeds
         # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L537-L555
-        self.cmd_vel_publisher = self.create_publisher(
-            Twist, 
-            'cmd_vel', 
-            10, 
-            callback_group=publisher_callback_group)
+        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
 
         #self.orientation_publisher = self.create_publisher(Float32, '/orientation', 10)
 
@@ -155,35 +147,18 @@ class RobotController(Node):
 
         # Creates a timer that calls the control_loop method repeatedly - each loop represents single iteration of the FSM
         self.timer_period = 0.1 # 100 milliseconds = 10 Hz
-        self.timer = self.create_timer(
-            self.timer_period, 
-            self.control_loop, 
-            callback_group=timer_callback_group)
+        self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
 
-        self.zones = None
-        self.current_zone_target = None
+        self.zones = ZoneList()
         self.navigator = BasicNavigator()
-        
-        # Set up nav2
-        initial_pose = PoseStamped()
-        initial_pose.header.frame_id = 'map'
-        initial_pose.header.stamp = self.get_clock().now().to_msg()
-        initial_pose.pose.position.x = 0.0
-        initial_pose.pose.position.y = 0.0
-        initial_pose.pose.orientation.w = 1.0
-        
-        self.navigator.setInitialPose(initial_pose)
         self.navigator.waitUntilNav2Active()
         
-        # Add zone subscriber with correct message type
         self.zone_subscriber = self.create_subscription(
             ZoneList,
             'zones',
             self.zone_callback,
-            10,
-            callback_group=timer_callback_group)
-
-        self.previous_time = self.get_clock().now()
+            10, callback_group=timer_callback_group
+        )
 
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
@@ -243,25 +218,6 @@ class RobotController(Node):
 
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
-        try:
-            t = self.tf_buffer.lookup_transform(
-                'map',
-                'base_footprint',
-                rclpy.time.Time())
-            
-            self.x = t.transform.translation.x
-            self.y = t.transform.translation.y
-            
-            (roll, pitch, yaw) = euler_from_quaternion([
-                t.transform.rotation.x,
-                t.transform.rotation.y,
-                t.transform.rotation.z,
-                t.transform.rotation.w])
-            
-        except TransformException as e:
-            self.get_logger().info(f"Transform error: {e}")
-            return
-
         # Add debug info about items near the start of control_loop
         if len(self.items.data) > 0:
             item = self.items.data[0]
@@ -351,9 +307,13 @@ class RobotController(Node):
 
             case State.COLLECTING:
                 if len(self.items.data) == 0:
-                    self.previous_pose = self.pose
-                    self.goal_distance = random.uniform(1.0, 2.0)
-                    self.state = State.FORWARD
+                    # If we have an item held, navigate to a zone
+                    if self.item_held is not None:
+                        self.state = State.NAVIGATING_TO_ZONE
+                        # Find suitable zone and set navigation goal
+                        self.set_zone_navigation_goal()
+                    else:
+                        self.state = State.FORWARD
                     return
                 
                 # Choose the closest item based on diameter (larger diameter = closer)
@@ -380,20 +340,33 @@ class RobotController(Node):
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Successfully picked up item!')
-                            self.state = State.NAVIGATING_TO_ZONE
+                            self.state = State.FORWARD
                         else:
                             self.get_logger().info('Failed to pick up item: ' + response.message)
+                            # Move slightly closer if pickup failed
                             msg.linear.x = 0.05
                             self.cmd_vel_publisher.publish(msg)
                     except Exception as e:
                         self.get_logger().info(f'Service call failed: {str(e)}')
                 else:
-                    msg.linear.x = 0.25 * estimated_distance
-                    msg.angular.z = angle_to_item
+                    # Use proportional control for smoother approach
+                    msg.linear.x = 0.25 * estimated_distance  # Proportional to distance
+                    msg.angular.z = angle_to_item  # Proportional to angle offset
                     self.cmd_vel_publisher.publish(msg)
 
+            case State.NAVIGATING_TO_ZONE:
+                if not self.navigator.isTaskComplete():
+                    feedback = self.navigator.getFeedback()
+                    self.get_logger().info(f'Estimated time to zone: {Duration.from_msg(feedback.estimated_time_remaining).nanoseconds / 1e9:.0f} seconds')
+                else:
+                    result = self.navigator.getResult()
+                    if result == TaskResult.SUCCEEDED:
+                        self.state = State.OFFLOADING
+                    else:
+                        # Try another zone if navigation failed
+                        self.set_zone_navigation_goal()
+
             case State.OFFLOADING:
-                # Try to offload the item
                 rqt = ItemRequest.Request()
                 rqt.robot_id = self.robot_id
                 try:
@@ -401,131 +374,17 @@ class RobotController(Node):
                     rclpy.spin_until_future_complete(self, future)
                     response = future.result()
                     if response.success:
-                        self.get_logger().info('Successfully offloaded item: ' + response.message)
-                        self.previous_pose = self.pose
-                        self.goal_distance = random.uniform(1.0, 2.0)
+                        self.get_logger().info('Successfully offloaded item!')
                         self.state = State.FORWARD
                     else:
                         self.get_logger().info('Failed to offload item: ' + response.message)
-                        self.current_zone_target = None
+                        # Try another zone
                         self.state = State.NAVIGATING_TO_ZONE
+                        self.set_zone_navigation_goal()
                 except Exception as e:
                     self.get_logger().info(f'Service call failed: {str(e)}')
-            case State.NAVIGATING_TO_ZONE:
-                time_difference = self.get_clock().now() - self.previous_time
-                if time_difference > Duration(seconds=300):
-                    self.navigator.cancelTask()
-                    self.previous_time = self.get_clock().now()
-                    self.get_logger().info(f"Navigation timeout, cancelling...")
-                    self.current_zone_target = None
-                    return
+                    self.state = State.NAVIGATING_TO_ZONE
 
-                if self.zones is None or len(self.zones) == 0:
-                    self.get_logger().info('No zones detected, continuing to search...')
-                    return
-                
-                if not self.current_zone_target:
-                    # Pick a random zone to try
-                    self.current_zone_target = random.choice(self.zones)
-                    
-                    goal_pose = PoseStamped()
-                    goal_pose.header.frame_id = 'map'
-                    goal_pose.header.stamp = self.get_clock().now().to_msg()
-                    goal_pose.pose.position.x = self.current_zone_target.x
-                    goal_pose.pose.position.y = self.current_zone_target.y
-                    
-                    # Set orientation using quaternion
-                    angle = random.uniform(-180, 180)
-                    (goal_pose.pose.orientation.x,
-                     goal_pose.pose.orientation.y,
-                     goal_pose.pose.orientation.z,
-                     goal_pose.pose.orientation.w) = quaternion_from_euler(0, 0, math.radians(angle), axes='sxyz')
-                    
-                    self.get_logger().info(f'Navigating to zone at ({goal_pose.pose.position.x:.2f}, {goal_pose.pose.position.y:.2f})')
-                    self.navigator.goToPose(goal_pose)
-                
-                if not self.navigator.isTaskComplete():
-                    feedback = self.navigator.getFeedback()
-                    self.get_logger().info(f'Distance remaining: {feedback.distance_remaining:.2f}m')
-                    
-                    # Add timeout handling
-                    if Duration.from_msg(feedback.navigation_time) > Duration(seconds=30):
-                        self.get_logger().info('Navigation took too long... cancelling')
-                        self.navigator.cancelTask()
-                        self.current_zone_target = None
-                else:
-                    result = self.navigator.getResult()
-                    
-                    match result:
-                        case TaskResult.SUCCEEDED:
-                            self.get_logger().info('Reached zone, spinning to align')
-                            self.navigator.spin(spin_dist=math.radians(180), time_allowance=10)
-                            self.state = State.SPINNING
-                        
-                        case TaskResult.CANCELED:
-                            self.get_logger().info('Navigation was canceled!')
-                            self.current_zone_target = None
-                            self.state = State.NAVIGATING_TO_ZONE
-                        
-                        case TaskResult.FAILED:
-                            self.get_logger().info('Navigation failed!')
-                            self.current_zone_target = None
-                            self.state = State.NAVIGATING_TO_ZONE
-                        
-                        case _:
-                            self.get_logger().info('Navigation has an invalid return status!')
-                            self.current_zone_target = None
-            case State.SPINNING:
-                if not self.navigator.isTaskComplete():
-                    feedback = self.navigator.getFeedback()
-                    self.get_logger().info(f"Turned: {math.degrees(feedback.angular_distance_traveled):.2f} degrees")
-                else:
-                    result = self.navigator.getResult()
-                    
-                    match result:
-                        case TaskResult.SUCCEEDED:
-                            self.get_logger().info(f"Spin succeeded, backing up")
-                            self.navigator.backup(backup_dist=0.15, backup_speed=0.025, time_allowance=10)
-                            self.state = State.BACKUP
-                        
-                        case TaskResult.CANCELED:
-                            self.get_logger().info(f"Spin was canceled!")
-                            self.current_zone_target = None
-                            self.state = State.NAVIGATING_TO_ZONE
-                        
-                        case TaskResult.FAILED:
-                            self.get_logger().info(f"Spin failed!")
-                            self.current_zone_target = None
-                            self.state = State.NAVIGATING_TO_ZONE
-                        
-                        case _:
-                            self.get_logger().info(f"Spin has an invalid return status!")
-                            self.current_zone_target = None
-            case State.BACKUP:
-                if not self.navigator.isTaskComplete():
-                    feedback = self.navigator.getFeedback()
-                    self.get_logger().info(f"Distance travelled: {feedback.distance_traveled:.2f} metres")
-                else:
-                    result = self.navigator.getResult()
-                    
-                    match result:
-                        case TaskResult.SUCCEEDED:
-                            self.get_logger().info(f"Backup succeeded, attempting offload")
-                            self.state = State.OFFLOADING
-                        
-                        case TaskResult.CANCELED:
-                            self.get_logger().info(f"Backup was canceled!")
-                            self.current_zone_target = None
-                            self.state = State.NAVIGATING_TO_ZONE
-                        
-                        case TaskResult.FAILED:
-                            self.get_logger().info(f"Backup failed!")
-                            self.current_zone_target = None
-                            self.state = State.NAVIGATING_TO_ZONE
-                        
-                        case _:
-                            self.get_logger().info(f"Backup has an invalid return status!")
-                            self.current_zone_target = None
             case _:
                 pass
         
@@ -533,15 +392,38 @@ class RobotController(Node):
         msg = Twist()
         self.cmd_vel_publisher.publish(msg)
         self.get_logger().info(f"Stopping: {msg}")
-        self.navigator.lifecycleShutdown()
         super().destroy_node()
 
     def zone_callback(self, msg):
-        self.zones = msg.data
-        if len(self.zones) > 0:
-            self.get_logger().info(f'Zones detected: {len(self.zones)}')
-            for zone in self.zones:
-                self.get_logger().info(f'Zone at ({zone.x}, {zone.y})')
+        self.zones = msg
+
+    def set_zone_navigation_goal(self):
+        if len(self.zones.data) == 0:
+            self.get_logger().warn('No zones visible!')
+            return False
+        
+        # Choose a random zone to try
+        zone = random.choice(self.zones.data)
+        
+        goal_pose = PoseStamped()
+        goal_pose.header.frame_id = 'map'
+        goal_pose.header.stamp = self.get_clock().now().to_msg()
+        
+        # Set position slightly in front of zone
+        goal_pose.pose.position.x = zone.x
+        goal_pose.pose.position.y = zone.y
+        
+        # Set orientation facing the zone
+        angle = math.atan2(zone.y - self.pose.position.y, 
+                          zone.x - self.pose.position.x)
+        q = quaternion_from_euler(0, 0, angle)
+        goal_pose.pose.orientation.x = q[0]
+        goal_pose.pose.orientation.y = q[1]
+        goal_pose.pose.orientation.z = q[2]
+        goal_pose.pose.orientation.w = q[3]
+        
+        self.navigator.goToPose(goal_pose)
+        return True
 
 def main(args=None):
 
