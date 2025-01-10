@@ -316,6 +316,49 @@ class RobotController(Node):
                     self.state = State.FORWARD
 
             case State.COLLECTING:
+                # If we have an item, prioritize going to a zone
+                if self.current_item is not None:
+                    if len(self.zones.data) > 0:
+                        closest_zone = self.zones.data[0]  # Just take the first visible zone
+                        self.get_logger().info(f'Found a zone, size: {closest_zone.size:.3f}, x: {closest_zone.x}')
+                        
+                        msg = Twist()
+                        angle_to_zone = closest_zone.x / 320.0
+                        
+                        if closest_zone.size > 0.3:  # Close enough to offload
+                            msg.linear.x = 0.0
+                            msg.angular.z = 0.0
+                            self.cmd_vel_publisher.publish(msg)
+                            
+                            rqt = ItemRequest.Request()
+                            rqt.robot_id = self.robot_id
+                            try:
+                                future = self.offload_service.call_async(rqt)
+                                rclpy.spin_until_future_complete(self, future)
+                                response = future.result()
+                                if response.success:
+                                    self.get_logger().info(f'Successfully offloaded {self.current_item} item')
+                                    self.current_item = None
+                                    self.state = State.FORWARD
+                                else:
+                                    self.get_logger().info(f'Failed to offload item: {response.message}')
+                            except Exception as e:
+                                self.get_logger().info(f'Offload service call failed: {str(e)}')
+                        else:
+                            # Zone visible but not close enough, approach it
+                            approach_speed = 0.15 if closest_zone.size > 0.2 else 0.25
+                            msg.linear.x = approach_speed * (1.0 - closest_zone.size)
+                            msg.angular.z = angle_to_zone
+                            self.cmd_vel_publisher.publish(msg)
+                    else:
+                        # No zones visible, do a slow turn to search
+                        msg = Twist()
+                        msg.linear.x = 0.0
+                        msg.angular.z = ANGULAR_VELOCITY * 0.5
+                        self.cmd_vel_publisher.publish(msg)
+                    return
+
+                # If we don't have an item, try to collect one
                 if len(self.items.data) == 0:
                     self.previous_pose = self.pose
                     self.goal_distance = random.uniform(1.0, 2.0)
@@ -342,46 +385,6 @@ class RobotController(Node):
                         if response.success:
                             self.current_item = closest_item.colour
                             self.get_logger().info(f'Successfully picked up {self.current_item} item')
-                            
-                            # Try to go to any visible zone after pickup
-                            if len(self.zones.data) > 0:
-                                closest_zone = self.zones.data[0]  # Just take the first visible zone
-                                self.get_logger().info(f'Found a zone, moving to it')
-                                
-                                if closest_zone.size > 0.3:  # Close enough to offload
-                                    rqt = ItemRequest.Request()
-                                    rqt.robot_id = self.robot_id
-                                    try:
-                                        future = self.offload_service.call_async(rqt)
-                                        rclpy.spin_until_future_complete(self, future)
-                                        response = future.result()
-                                        if response.success:
-                                            self.get_logger().info(f'Successfully offloaded {self.current_item} item')
-                                            self.current_item = None
-                                            self.state = State.FORWARD
-                                        else:
-                                            self.get_logger().info(f'Failed to offload item: {response.message}')
-                                            # Start random walk
-                                            msg.linear.x = LINEAR_VELOCITY * 0.5
-                                            msg.angular.z = random.choice([TURN_LEFT, TURN_RIGHT]) * ANGULAR_VELOCITY * 0.5
-                                            self.cmd_vel_publisher.publish(msg)
-                                    except Exception as e:
-                                        self.get_logger().info(f'Offload service call failed: {str(e)}')
-                                else:
-                                    # Zone visible but not close enough, approach it
-                                    msg = Twist()
-                                    angle_to_zone = closest_zone.x / 320.0
-                                    approach_speed = 0.15 if closest_zone.size > 0.2 else 0.25
-                                    msg.linear.x = approach_speed * (1.0 - closest_zone.size)
-                                    msg.angular.z = angle_to_zone
-                                    self.cmd_vel_publisher.publish(msg)
-                            else:
-                                # No zones visible, start random walk
-                                self.get_logger().info('No zones visible, starting random walk')
-                                msg = Twist()
-                                msg.linear.x = LINEAR_VELOCITY * 0.5
-                                msg.angular.z = random.choice([TURN_LEFT, TURN_RIGHT]) * ANGULAR_VELOCITY * 0.5
-                                self.cmd_vel_publisher.publish(msg)
                         else:
                             self.get_logger().info(f'Failed to pick up item: {response.message}')
                             msg.linear.x = 0.05
