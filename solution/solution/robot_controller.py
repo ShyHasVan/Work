@@ -206,11 +206,10 @@ class RobotController(Node):
         
         match self.state:
             case State.FORWARD:
-                # If we see a zone, go to DEPOSITING state
-                zone = self.find_suitable_zone()
-                if zone:
-                    self.state = State.DEPOSITING
-                    self.get_logger().info(f"Found {ZONE_COLORS.get(zone.zone, 'unknown')} zone, moving to it")
+                # If we see an item, go to COLLECTING state
+                if len(self.items.data) > 0:
+                    self.state = State.COLLECTING
+                    self.get_logger().info(f"Found {self.items.data[0].colour} item, moving to collect")
                     return
 
                 # Handle obstacles like week 5
@@ -293,6 +292,43 @@ class RobotController(Node):
                         f'x_offset={zone.x}, '
                         f'turning={msg.angular.z:.2f}'
                     )
+
+            case State.COLLECTING:
+                if len(self.items.data) == 0:
+                    self.state = State.FORWARD
+                    return
+                
+                item = self.items.data[0]
+                # Use week 5's proven collection logic
+                estimated_distance = 32.4 * float(item.diameter) ** -0.75
+
+                if estimated_distance <= ITEM_PICKUP_DISTANCE:
+                    request = ItemRequest.Request()
+                    request.robot_id = self.robot_id
+                    try:
+                        future = self.pick_up_service.call_async(request)
+                        rclpy.spin_until_future_complete(self, future)
+                        response = future.result()
+                        if response.success:
+                            self.get_logger().info(f'Picked up {item.colour} item')
+                            self.holding_item = True
+                            self.held_item_color = item.colour
+                            # After pickup, go straight to DEPOSITING to find a zone
+                            self.state = State.DEPOSITING
+                        else:
+                            self.get_logger().info('Failed to pick up: ' + response.message)
+                            self.state = State.FORWARD
+                    except Exception as e:
+                        self.get_logger().error(f'Service call failed: {e}')
+                        self.state = State.FORWARD
+                    return
+
+                # Move towards item using visual servoing from week 5
+                msg = Twist()
+                msg.linear.x = 0.25 * estimated_distance
+                msg.angular.z = item.x / 320.0
+                self.cmd_vel_publisher.publish(msg)
+                self.get_logger().info(f'Moving to item: distance={estimated_distance:.2f}, x_offset={item.x}')
 
             case _:
                 self.state = State.FORWARD
