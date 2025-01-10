@@ -41,7 +41,7 @@ ZONE_COLORS = {
 }
 
 ITEM_PICKUP_DISTANCE = 0.35
-ZONE_DEPOSIT_DISTANCE = 0.2  # Size threshold for being close enough to deposit
+ZONE_DEPOSIT_DISTANCE = 0.4  # Increased from 0.2 to ensure we're well inside the zone
 
 class State(Enum):
     FORWARD = 0    # Moving forward, looking for items
@@ -262,16 +262,19 @@ class RobotController(Node):
 
                 # Navigate to zone using visual servoing
                 msg = Twist()
-                msg.linear.x = 0.25 * (1.0 - zone.size)  # Slow down as we get closer
-                msg.angular.z = zone.x / 320.0  # Center the zone in view
-                self.cmd_vel_publisher.publish(msg)
-
                 if zone.size >= ZONE_DEPOSIT_DISTANCE:
-                    self.get_logger().info(f'Reached {ZONE_COLORS.get(zone.zone, "unknown")} zone!')
-                    # Just stop in the zone
+                    self.get_logger().info(f'Inside {ZONE_COLORS.get(zone.zone, "unknown")} zone!')
+                    # Stop once we're well inside
                     msg = Twist()
                     self.cmd_vel_publisher.publish(msg)
                     return
+                else:
+                    # Move faster when far, slower when close, but maintain minimum speed
+                    distance_factor = 1.0 - zone.size
+                    msg.linear.x = max(0.15, 0.3 * distance_factor)  # Minimum speed of 0.15
+                    msg.angular.z = zone.x / 320.0  # Center the zone in view
+                    self.cmd_vel_publisher.publish(msg)
+                    self.get_logger().info(f'Moving to zone, size: {zone.size:.2f}, target size: {ZONE_DEPOSIT_DISTANCE:.2f}')
 
             case _:
                 self.state = State.FORWARD
