@@ -209,6 +209,7 @@ class RobotController(Node):
                 # First check for items
                 if len(self.items.data) > 0:
                     self.state = State.COLLECTING
+                    self.get_logger().info(f"Found {self.items.data[0].colour} item, moving to collect")
                     return
 
                 # Handle obstacles like week 5
@@ -232,14 +233,7 @@ class RobotController(Node):
                 self.cmd_vel_publisher.publish(msg)
 
             case State.TURNING:
-                # Check if we've found a zone
-                zone = self.find_suitable_zone()
-                if zone:
-                    self.state = State.DEPOSITING
-                    self.get_logger().info(f"Found {ZONE_COLORS.get(zone.zone, 'unknown')} zone while turning")
-                    return
-
-                # Calculate how far we've turned
+                # Just handle turning like week 5
                 angle_turned = abs(angles.normalize_angle(self.yaw - self.previous_yaw))
                 angle_to_turn = math.radians(self.turn_angle)
 
@@ -247,50 +241,9 @@ class RobotController(Node):
                     self.state = State.FORWARD
                     return
 
-                # Keep turning
                 msg = Twist()
                 msg.angular.z = ANGULAR_VELOCITY * self.turn_direction
                 self.cmd_vel_publisher.publish(msg)
-
-            case State.DEPOSITING:
-                zone = self.find_suitable_zone()
-                if not zone:
-                    self.state = State.TURNING
-                    self.get_logger().warn("Lost sight of zone, turning to find it again")
-                    return
-
-                # Check for obstacles first
-                if self.scan_triggered[SCAN_FRONT]:
-                    self.get_logger().warn("Obstacle detected while approaching zone, adjusting...")
-                    msg = Twist()
-                    msg.angular.z = ANGULAR_VELOCITY * TURN_LEFT
-                    self.cmd_vel_publisher.publish(msg)
-                    return
-
-                # Navigate to zone using visual servoing
-                msg = Twist()
-                
-                # Keep moving until we're well inside the zone
-                if zone.size >= ZONE_DEPOSIT_DISTANCE:
-                    self.get_logger().info(f'Fully inside {ZONE_COLORS.get(zone.zone, "unknown")} zone!')
-                    # Stop once we're well inside
-                    msg = Twist()
-                    self.cmd_vel_publisher.publish(msg)
-                    return
-                else:
-                    # Use consistent forward speed but adjust turning based on zone position
-                    msg.linear.x = ZONE_APPROACH_SPEED
-                    # Stronger turning when zone is off-center
-                    turn_factor = zone.x / 320.0
-                    msg.angular.z = turn_factor * ANGULAR_VELOCITY
-                    
-                    self.cmd_vel_publisher.publish(msg)
-                    self.get_logger().info(
-                        f'Moving to zone: size={zone.size:.2f}, '
-                        f'target={ZONE_DEPOSIT_DISTANCE:.2f}, '
-                        f'x_offset={zone.x}, '
-                        f'turning={msg.angular.z:.2f}'
-                    )
 
             case State.COLLECTING:
                 if len(self.items.data) == 0:
@@ -299,9 +252,7 @@ class RobotController(Node):
                     return
                 
                 item = self.items.data[0]
-                # Use week 5's proven collection logic
                 estimated_distance = 32.4 * float(item.diameter) ** -0.75
-
                 self.get_logger().info(f'Estimated distance {estimated_distance}')
 
                 if estimated_distance <= ITEM_PICKUP_DISTANCE:
@@ -315,19 +266,54 @@ class RobotController(Node):
                             self.get_logger().info(f'Picked up {item.colour} item')
                             self.holding_item = True
                             self.held_item_color = item.colour
-                            self.items.data = []  # Clear items like week 5
-                            self.state = State.DEPOSITING  # Go straight to depositing
+                            self.items.data = []
+                            self.state = State.DEPOSITING
+                            self.get_logger().info("Switching to DEPOSITING state")
                         else:
                             self.get_logger().info('Failed to pick up: ' + response.message)
+                            self.state = State.FORWARD
                     except Exception as e:
                         self.get_logger().error(f'Service call failed: {e}')
+                        self.state = State.FORWARD
                     return
 
-                # Move towards item using visual servoing from week 5
+                # Move towards item using visual servoing
                 msg = Twist()
                 msg.linear.x = 0.25 * estimated_distance
                 msg.angular.z = item.x / 320.0
                 self.cmd_vel_publisher.publish(msg)
+
+            case State.DEPOSITING:
+                zone = self.find_suitable_zone()
+                if not zone:
+                    msg = Twist()
+                    msg.angular.z = ANGULAR_VELOCITY  # Keep turning to find a zone
+                    self.cmd_vel_publisher.publish(msg)
+                    return
+
+                # Navigate to zone using visual servoing
+                msg = Twist()
+                msg.linear.x = ZONE_APPROACH_SPEED
+                msg.angular.z = zone.x / 320.0
+                self.cmd_vel_publisher.publish(msg)
+
+                if zone.size >= ZONE_DEPOSIT_DISTANCE:
+                    request = ItemRequest.Request()
+                    request.robot_id = self.robot_id
+                    try:
+                        future = self.offload_service.call_async(request)
+                        rclpy.spin_until_future_complete(self, future)
+                        response = future.result()
+                        if response.success:
+                            self.get_logger().info(f'Deposited {self.held_item_color} item')
+                            self.holding_item = False
+                            self.held_item_color = None
+                            self.state = State.FORWARD
+                        else:
+                            self.get_logger().warn(f'Failed to deposit: {response.message}')
+                    except Exception as e:
+                        self.get_logger().error(f'Service call failed: {e}')
+                    return
 
             case _:
                 self.state = State.FORWARD
