@@ -70,29 +70,28 @@ class RobotController(Node):
         super().__init__('robot_controller')
         
         # Class variables used to store persistent values between executions of callbacks and control loop
-        self.state = State.FORWARD # Current FSM state
-        self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
-        self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
-        self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
-        self.previous_yaw = 0.0 # Snapshot of the angle for comparison against future angles
-        self.turn_angle = 0.0 # Relative angle to turn to in the TURNING state
-        self.turn_direction = TURN_LEFT # Direction to turn in the TURNING state
-        self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
-        self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
+        self.state = State.FORWARD
+        self.pose = Pose()
+        self.previous_pose = Pose()
+        self.yaw = 0.0
+        self.previous_yaw = 0.0
+        self.turn_angle = 0.0
+        self.turn_direction = TURN_LEFT
+        self.goal_distance = random.uniform(1.0, 2.0)
+        self.scan_triggered = [False] * 4
         self.items = ItemList()
         self.zones = ZoneList()
-        self.current_item = None  # Store the color of the currently held item
+        self.current_item = None
+        self.offload_attempted = False  # New flag to track offload attempts
         
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
 
-        # Here we use two callback groups, to ensure that those in 'client_callback_group' can be executed
-        # independently from those in 'timer_callback_group'. This allos calling the services below within
-        # a callback handled by the timer_callback_group. See https://docs.ros.org/en/humble/How-To-Guides/Using-callback-groups.html
-        # for a detailed discussion on the ROS executors and callback groups.
+        # Create callback groups
         client_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
 
+        # Services in client callback group
         self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
         self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
 
@@ -226,7 +225,7 @@ class RobotController(Node):
         
         # Add zone information
         if len(self.zones.data) > 0:
-            zones_info = [f"{z.zone}({z.x}, {z.y})" for z in self.zones.data]
+            zones_info = [f"{z.zone}({z.x}, {z.y}, size={z.size:.2f})" for z in self.zones.data]
             status_msg += f', Zones in view: {", ".join(zones_info)}'
         else:
             status_msg += ', No zones in view'
@@ -266,6 +265,7 @@ class RobotController(Node):
                 # If we're holding an item, prioritize going to offloading state
                 if self.current_item is not None:
                     self.state = State.OFFLOADING
+                    self.offload_attempted = False  # Reset the flag when entering offloading state
                     return
                 
                 if self.scan_triggered[SCAN_FRONT]:
@@ -310,6 +310,7 @@ class RobotController(Node):
                 # If we're holding an item, prioritize going to offloading state
                 if self.current_item is not None:
                     self.state = State.OFFLOADING
+                    self.offload_attempted = False  # Reset the flag when entering offloading state
                     return
                 
                 if len(self.items.data) > 0 and self.current_item is None:
@@ -352,9 +353,10 @@ class RobotController(Node):
                         rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
-                            self.state = State.OFFLOADING
                             self.current_item = closest_item.colour
                             self.get_logger().info(f'Successfully picked up {self.current_item} item')
+                            self.state = State.OFFLOADING
+                            self.offload_attempted = False  # Reset the flag when entering offloading state
                         else:
                             self.get_logger().info(f'Failed to pick up item: {response.message}')
                             msg.linear.x = 0.05
@@ -368,6 +370,7 @@ class RobotController(Node):
 
             case State.OFFLOADING:
                 if not self.current_item:
+                    self.get_logger().info('No item to offload, returning to FORWARD state')
                     self.state = State.FORWARD
                     return
 
@@ -380,11 +383,17 @@ class RobotController(Node):
 
                 matching_zones = [z for z in self.zones.data if z.zone == target_zone]
                 if not matching_zones:
-                    # No matching zone visible, turn to search
-                    self.previous_yaw = self.yaw
-                    self.state = State.TURNING
-                    self.turn_angle = random.uniform(30, 90)
-                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    if not self.offload_attempted:
+                        self.get_logger().info('No matching zone visible, turning to search')
+                        self.previous_yaw = self.yaw
+                        self.state = State.TURNING
+                        self.turn_angle = random.uniform(30, 90)
+                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    else:
+                        # If we've already attempted to offload, try moving forward to find a zone
+                        msg = Twist()
+                        msg.linear.x = LINEAR_VELOCITY
+                        self.cmd_vel_publisher.publish(msg)
                     return
 
                 closest_zone = matching_zones[0]
@@ -400,24 +409,35 @@ class RobotController(Node):
                     msg.angular.z = 0.0
                     self.cmd_vel_publisher.publish(msg)
                     
-                    rqt = ItemRequest.Request()
-                    rqt.robot_id = self.robot_id
-                    try:
-                        future = self.offload_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
-                        response = future.result()
-                        if response.success:
-                            self.get_logger().info(f'Successfully offloaded {self.current_item} item')
-                            self.current_item = None
-                            self.state = State.FORWARD
-                        else:
-                            self.get_logger().info(f'Failed to offload item: {response.message}')
-                            msg.linear.x = 0.05
-                            self.cmd_vel_publisher.publish(msg)
-                    except Exception as e:
-                        self.get_logger().info(f'Service call failed: {str(e)}')
+                    if not self.offload_attempted:
+                        self.offload_attempted = True
+                        rqt = ItemRequest.Request()
+                        rqt.robot_id = self.robot_id
+                        try:
+                            future = self.offload_service.call_async(rqt)
+                            rclpy.spin_until_future_complete(self, future)
+                            response = future.result()
+                            if response.success:
+                                self.get_logger().info(f'Successfully offloaded {self.current_item} item')
+                                self.current_item = None
+                                self.state = State.FORWARD
+                            else:
+                                self.get_logger().info(f'Failed to offload item: {response.message}')
+                                # If offload fails, back up slightly and try again
+                                msg.linear.x = -0.1
+                                self.cmd_vel_publisher.publish(msg)
+                        except Exception as e:
+                            self.get_logger().info(f'Service call failed: {str(e)}')
+                    else:
+                        # If we've already attempted to offload, try backing up and approaching again
+                        msg.linear.x = -0.1
+                        self.cmd_vel_publisher.publish(msg)
+                        if zone_size < 0.25:  # If we've backed up enough
+                            self.offload_attempted = False
                 else:
-                    msg.linear.x = 0.25 * (1.0 - zone_size)
+                    # Approach the zone more carefully when close
+                    approach_speed = 0.15 if zone_size > 0.2 else 0.25
+                    msg.linear.x = approach_speed * (1.0 - zone_size)
                     msg.angular.z = angle_to_zone
                     self.cmd_vel_publisher.publish(msg)
 
