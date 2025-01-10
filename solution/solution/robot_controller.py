@@ -202,7 +202,8 @@ class RobotController(Node):
         marker.pose = self.pose
         self.marker_publisher.publish(marker)
 
-        self.get_logger().info(f"STATE: {self.state}, Zones visible: {len(self.zones.data)}")
+        self.get_logger().info(f"STATE: {self.state}, Holding item: {self.holding_item}, "
+                             f"Item color: {self.held_item_color}, Zones visible: {len(self.zones.data)}")
         
         match self.state:
             case State.FORWARD:
@@ -242,6 +243,12 @@ class RobotController(Node):
                 self.cmd_vel_publisher.publish(msg)
 
             case State.TURNING:
+                # Log the current state and what we're doing
+                if self.holding_item:
+                    self.get_logger().info(f"TURNING: Looking for zone while holding {self.held_item_color} item")
+                else:
+                    self.get_logger().info("TURNING: Avoiding obstacle")
+
                 # If holding an item, prioritize finding a zone
                 if self.holding_item:
                     zone = self.find_suitable_zone()
@@ -254,6 +261,7 @@ class RobotController(Node):
                     msg = Twist()
                     msg.angular.z = ANGULAR_VELOCITY * self.turn_direction
                     self.cmd_vel_publisher.publish(msg)
+                    self.get_logger().info(f"Still turning to find zone, current yaw: {math.degrees(self.yaw):.1f} degrees")
                     return
 
                 # Normal turning behavior for obstacle avoidance
@@ -310,6 +318,7 @@ class RobotController(Node):
 
             case State.COLLECTING:
                 if len(self.items.data) == 0:
+                    self.get_logger().info("Lost sight of item, returning to FORWARD state")
                     self.state = State.FORWARD
                     return
                 
@@ -318,23 +327,37 @@ class RobotController(Node):
                 estimated_distance = 32.4 * float(item.diameter) ** -0.75
 
                 if estimated_distance <= ITEM_PICKUP_DISTANCE:
+                    self.get_logger().info("Attempting to pick up item...")
                     request = ItemRequest.Request()
                     request.robot_id = self.robot_id
                     try:
                         future = self.pick_up_service.call_async(request)
+                        if future is None:
+                            self.get_logger().error("Failed to send pickup request")
+                            self.state = State.FORWARD
+                            return
+                            
                         rclpy.spin_until_future_complete(self, future)
-                        response = future.result()
-                        if response.success:
-                            self.get_logger().info(f'Picked up {item.colour} item')
-                            self.holding_item = True
-                            self.held_item_color = item.colour
-                            # After pickup, go straight to DEPOSITING to find a zone
-                            self.state = State.DEPOSITING
+                        if future.done():
+                            response = future.result()
+                            if response.success:
+                                self.get_logger().info(f'Successfully picked up {item.colour} item')
+                                self.holding_item = True
+                                self.held_item_color = item.colour
+                                # After pickup, go to TURNING to find a zone
+                                self.previous_yaw = self.yaw
+                                self.state = State.TURNING
+                                self.turn_angle = 45
+                                self.turn_direction = TURN_LEFT
+                                self.get_logger().info("Item picked up, switching to TURNING to find a zone")
+                            else:
+                                self.get_logger().warn(f'Failed to pick up: {response.message}')
+                                self.state = State.FORWARD
                         else:
-                            self.get_logger().info('Failed to pick up: ' + response.message)
+                            self.get_logger().error("Pickup request timed out")
                             self.state = State.FORWARD
                     except Exception as e:
-                        self.get_logger().error(f'Service call failed: {e}')
+                        self.get_logger().error(f'Service call failed: {str(e)}')
                         self.state = State.FORWARD
                     return
 
