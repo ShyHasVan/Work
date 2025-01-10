@@ -202,30 +202,23 @@ class RobotController(Node):
         marker.pose = self.pose
         self.marker_publisher.publish(marker)
 
-        self.get_logger().info(f"STATE: {self.state}, Holding item: {self.holding_item}, "
-                             f"Item color: {self.held_item_color}, Zones visible: {len(self.zones.data)}")
+        self.get_logger().info(f"STATE: {self.state}, Zones visible: {len(self.zones.data)}")
         
-        # Stop moving if transitioning states
-        if self.state != State.FORWARD and self.state != State.COLLECTING:
-            msg = Twist()
-            self.cmd_vel_publisher.publish(msg)
-
         match self.state:
             case State.FORWARD:
-                # If holding an item, force transition to TURNING to find a zone
-                if self.holding_item:
-                    self.previous_yaw = self.yaw
-                    self.state = State.TURNING
-                    self.turn_angle = 45  # Turn in increments to scan for zones
-                    self.turn_direction = TURN_LEFT
-                    self.get_logger().info("Holding item, turning to find a zone")
-                    return
-
-                # If we see an item and aren't holding one, go to COLLECTING state
+                # First priority: Look for items if not holding one
                 if not self.holding_item and len(self.items.data) > 0:
                     self.state = State.COLLECTING
                     self.get_logger().info(f"Found {self.items.data[0].colour} item, moving to collect")
                     return
+
+                # Second priority: Look for zones if holding an item
+                if self.holding_item:
+                    zone = self.find_suitable_zone()
+                    if zone:
+                        self.state = State.DEPOSITING
+                        self.get_logger().info(f"Found {ZONE_COLORS.get(zone.zone, 'unknown')} zone, moving to deposit")
+                        return
 
                 # Handle obstacles like week 5
                 if self.scan_triggered[SCAN_FRONT]:
@@ -242,34 +235,20 @@ class RobotController(Node):
                     self.turn_direction = TURN_RIGHT if self.scan_triggered[SCAN_LEFT] else TURN_LEFT
                     return
 
-                # Move forward if no obstacles and not holding an item
+                # Move forward if no obstacles
                 msg = Twist()
                 msg.linear.x = LINEAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
 
             case State.TURNING:
-                # Log the current state and what we're doing
-                if self.holding_item:
-                    self.get_logger().info(f"TURNING: Looking for zone while holding {self.held_item_color} item")
-                else:
-                    self.get_logger().info("TURNING: Avoiding obstacle")
-
-                # If holding an item, prioritize finding a zone
-                if self.holding_item:
-                    zone = self.find_suitable_zone()
-                    if zone:
-                        self.state = State.DEPOSITING
-                        self.get_logger().info(f"Found {ZONE_COLORS.get(zone.zone, 'unknown')} zone while turning")
-                        return
-                    
-                    # Keep turning until we find a zone
-                    msg = Twist()
-                    msg.angular.z = ANGULAR_VELOCITY * self.turn_direction
-                    self.cmd_vel_publisher.publish(msg)
-                    self.get_logger().info(f"Still turning to find zone, current yaw: {math.degrees(self.yaw):.1f} degrees")
+                # Check if we've found a zone
+                zone = self.find_suitable_zone()
+                if zone:
+                    self.state = State.DEPOSITING
+                    self.get_logger().info(f"Found {ZONE_COLORS.get(zone.zone, 'unknown')} zone while turning")
                     return
 
-                # Normal turning behavior for obstacle avoidance
+                # Calculate how far we've turned
                 angle_turned = abs(angles.normalize_angle(self.yaw - self.previous_yaw))
                 angle_to_turn = math.radians(self.turn_angle)
 
@@ -277,60 +256,10 @@ class RobotController(Node):
                     self.state = State.FORWARD
                     return
 
+                # Keep turning
                 msg = Twist()
                 msg.angular.z = ANGULAR_VELOCITY * self.turn_direction
                 self.cmd_vel_publisher.publish(msg)
-
-            case State.COLLECTING:
-                if len(self.items.data) == 0:
-                    self.get_logger().info("Lost sight of item, returning to FORWARD state")
-                    self.state = State.FORWARD
-                    return
-                
-                item = self.items.data[0]
-                # Use week 5's proven collection logic
-                estimated_distance = 32.4 * float(item.diameter) ** -0.75
-
-                if estimated_distance <= ITEM_PICKUP_DISTANCE:
-                    self.get_logger().info("Attempting to pick up item...")
-                    request = ItemRequest.Request()
-                    request.robot_id = self.robot_id
-                    try:
-                        future = self.pick_up_service.call_async(request)
-                        rclpy.spin_until_future_complete(self, future)
-                        if future.done():
-                            response = future.result()
-                            if response.success:
-                                self.get_logger().info(f'Successfully picked up {item.colour} item')
-                                self.holding_item = True
-                                self.held_item_color = item.colour
-                                # Stop moving but ensure we transition to TURNING
-                                msg = Twist()
-                                self.cmd_vel_publisher.publish(msg)
-                                # Set up turning to find a zone
-                                self.previous_yaw = self.yaw
-                                self.state = State.TURNING
-                                self.turn_angle = 45
-                                self.turn_direction = TURN_LEFT
-                                self.get_logger().info("Item picked up, switching to TURNING to find a zone")
-                                return  # Return here to ensure next control_loop handles turning
-                            else:
-                                self.get_logger().warn(f'Failed to pick up: {response.message}')
-                                self.state = State.FORWARD
-                        else:
-                            self.get_logger().error("Pickup request timed out")
-                            self.state = State.FORWARD
-                    except Exception as e:
-                        self.get_logger().error(f'Service call failed: {str(e)}')
-                        self.state = State.FORWARD
-                    return
-
-                # Move towards item using visual servoing
-                msg = Twist()
-                msg.linear.x = 0.25 * estimated_distance
-                msg.angular.z = item.x / 320.0
-                self.cmd_vel_publisher.publish(msg)
-                self.get_logger().info(f'Moving to item: distance={estimated_distance:.2f}, x_offset={item.x}')
 
             case State.DEPOSITING:
                 zone = self.find_suitable_zone()
@@ -339,6 +268,7 @@ class RobotController(Node):
                     self.get_logger().warn("Lost sight of zone, turning to find it again")
                     return
 
+                # Check for obstacles first
                 if self.scan_triggered[SCAN_FRONT]:
                     self.get_logger().warn("Obstacle detected while approaching zone, adjusting...")
                     msg = Twist()
@@ -346,35 +276,23 @@ class RobotController(Node):
                     self.cmd_vel_publisher.publish(msg)
                     return
 
+                # Navigate to zone using visual servoing
                 msg = Twist()
+                
+                # Keep moving until we're well inside the zone
                 if zone.size >= ZONE_DEPOSIT_DISTANCE:
-                    self.get_logger().info(f'Fully inside {ZONE_COLORS.get(zone.zone, "unknown")} zone! Depositing item...')
-                    request = ItemRequest.Request()
-                    request.robot_id = self.robot_id
-                    try:
-                        future = self.offload_service.call_async(request)
-                        rclpy.spin_until_future_complete(self, future)
-                        if future.done():
-                            response = future.result()
-                            if response.success:
-                                self.get_logger().info(f'Successfully deposited {self.held_item_color} item')
-                                self.holding_item = False
-                                self.held_item_color = None
-                                self.state = State.FORWARD
-                            else:
-                                self.get_logger().warn(f'Failed to deposit: {response.message}')
-                                self.state = State.FORWARD
-                        else:
-                            self.get_logger().error("Deposit request timed out")
-                            self.state = State.FORWARD
-                    except Exception as e:
-                        self.get_logger().error(f'Service call failed: {str(e)}')
-                        self.state = State.FORWARD
+                    self.get_logger().info(f'Fully inside {ZONE_COLORS.get(zone.zone, "unknown")} zone!')
+                    # Stop once we're well inside
+                    msg = Twist()
+                    self.cmd_vel_publisher.publish(msg)
                     return
                 else:
+                    # Use consistent forward speed but adjust turning based on zone position
                     msg.linear.x = ZONE_APPROACH_SPEED
+                    # Stronger turning when zone is off-center
                     turn_factor = zone.x / 320.0
                     msg.angular.z = turn_factor * ANGULAR_VELOCITY
+                    
                     self.cmd_vel_publisher.publish(msg)
                     self.get_logger().info(
                         f'Moving to zone: size={zone.size:.2f}, '
@@ -383,15 +301,47 @@ class RobotController(Node):
                         f'turning={msg.angular.z:.2f}'
                     )
 
+            case State.COLLECTING:
+                if len(self.items.data) == 0:
+                    self.state = State.FORWARD
+                    return
+                
+                item = self.items.data[0]
+                # Use week 5's proven collection logic
+                estimated_distance = 32.4 * float(item.diameter) ** -0.75
+
+                if estimated_distance <= ITEM_PICKUP_DISTANCE:
+                    request = ItemRequest.Request()
+                    request.robot_id = self.robot_id
+                    try:
+                        future = self.pick_up_service.call_async(request)
+                        rclpy.spin_until_future_complete(self, future)
+                        response = future.result()
+                        if response.success:
+                            self.get_logger().info(f'Picked up {item.colour} item')
+                            self.holding_item = True
+                            self.held_item_color = item.colour
+                            self.state = State.FORWARD  # Go back to FORWARD to find a zone
+                        else:
+                            self.get_logger().info('Failed to pick up: ' + response.message)
+                    except Exception as e:
+                        self.get_logger().error(f'Service call failed: {e}')
+                    return
+
+                # Move towards item using visual servoing from week 5
+                msg = Twist()
+                msg.linear.x = 0.25 * estimated_distance
+                msg.angular.z = item.x / 320.0
+                self.cmd_vel_publisher.publish(msg)
+
+            case _:
+                self.state = State.FORWARD
+
 def main(args=None):
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
-    
     node = RobotController()
-    executor = rclpy.executors.MultiThreadedExecutor()
-    executor.add_node(node)
-    
     try:
-        executor.spin()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     except ExternalShutdownException:
