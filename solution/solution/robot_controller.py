@@ -10,7 +10,7 @@ from enum import Enum
 from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from assessment_interfaces.msg import ItemList, ZoneList
+from assessment_interfaces.msg import ItemList, ZoneList, Zone
 from auro_interfaces.srv import ItemRequest
 from auro_interfaces.msg import StringWithPose
 
@@ -34,10 +34,10 @@ SCAN_RIGHT = 3
 
 # Zone colors mapping
 ZONE_COLORS = {
-    1: "cyan",    # ZONE_CYAN
-    2: "purple",  # ZONE_PURPLE
-    3: "green",   # ZONE_GREEN
-    4: "pink"     # ZONE_PINK
+    Zone.ZONE_CYAN: "cyan",
+    Zone.ZONE_PURPLE: "purple",
+    Zone.ZONE_GREEN: "green",
+    Zone.ZONE_PINK: "pink"
 }
 
 ITEM_PICKUP_DISTANCE = 0.35
@@ -100,7 +100,7 @@ class RobotController(Node):
         
         self.zone_subscriber = self.create_subscription(
             ZoneList,
-            'zones',
+            'zone',
             self.zone_callback,
             10,
             callback_group=timer_cb_group
@@ -146,7 +146,11 @@ class RobotController(Node):
         self.items = msg
 
     def zone_callback(self, msg):
+        """Process incoming zone information"""
         self.zones = msg
+        if len(msg.data) > 0:
+            self.get_logger().info(f"Detected {len(msg.data)} zones: " + 
+                                 ", ".join([ZONE_COLORS.get(z.zone, "unknown") for z in msg.data]))
 
     def odom_callback(self, msg):
         self.pose = msg.pose.pose
@@ -169,11 +173,26 @@ class RobotController(Node):
         self.scan_triggered[SCAN_RIGHT] = min(right_ranges) < SCAN_THRESHOLD
 
     def find_suitable_zone(self):
-        """Return the first visible zone"""
+        """Find a visible zone"""
         if not self.zones.data:
             return None
-        # Just return the first zone we see
-        return self.zones.data[0] if self.zones.data else None
+        
+        # Log all visible zones for debugging
+        for zone in self.zones.data:
+            self.get_logger().info(f"Zone: {ZONE_COLORS.get(zone.zone, 'unknown')}, "
+                                 f"size: {zone.size:.2f}, x: {zone.x}, y: {zone.y}")
+        
+        # Return the largest visible zone (closest to robot)
+        largest_zone = max(self.zones.data, key=lambda z: z.size) if self.zones.data else None
+        
+        if largest_zone:
+            self.get_logger().info(
+                f"Selected zone: {ZONE_COLORS.get(largest_zone.zone, 'unknown')}, "
+                f"size: {largest_zone.size:.2f}, "
+                f"position: ({largest_zone.x}, {largest_zone.y})"
+            )
+            
+        return largest_zone
 
     def control_loop(self):
         # Update marker for visualization
@@ -187,9 +206,10 @@ class RobotController(Node):
         match self.state:
             case State.FORWARD:
                 # If we see a zone, go to DEPOSITING state
-                if self.find_suitable_zone():
+                zone = self.find_suitable_zone()
+                if zone:
                     self.state = State.DEPOSITING
-                    self.get_logger().info("Found zone, moving to it")
+                    self.get_logger().info(f"Found {ZONE_COLORS.get(zone.zone, 'unknown')} zone, moving to it")
                     return
 
                 # Handle obstacles like week 5
@@ -214,9 +234,10 @@ class RobotController(Node):
 
             case State.TURNING:
                 # Check if we've found a zone
-                if self.find_suitable_zone():
+                zone = self.find_suitable_zone()
+                if zone:
                     self.state = State.DEPOSITING
-                    self.get_logger().info("Found zone while turning, moving to it")
+                    self.get_logger().info(f"Found {ZONE_COLORS.get(zone.zone, 'unknown')} zone while turning")
                     return
 
                 # Calculate how far we've turned
@@ -236,6 +257,7 @@ class RobotController(Node):
                 zone = self.find_suitable_zone()
                 if not zone:
                     self.state = State.TURNING
+                    self.get_logger().warn("Lost sight of zone, turning to find it again")
                     return
 
                 # Navigate to zone using visual servoing
