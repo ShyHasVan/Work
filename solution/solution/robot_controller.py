@@ -355,8 +355,39 @@ class RobotController(Node):
                         if response.success:
                             self.current_item = closest_item.colour
                             self.get_logger().info(f'Successfully picked up {self.current_item} item')
-                            self.state = State.OFFLOADING
-                            self.offload_attempted = False  # Reset the flag when entering offloading state
+                            
+                            # Immediately try to offload after successful pickup
+                            target_zone = ITEM_TO_ZONE.get(self.current_item)
+                            if not target_zone:
+                                self.get_logger().info(f'No matching zone for item color: {self.current_item}, dropping item')
+                                self.current_item = None
+                                self.state = State.FORWARD
+                                return
+
+                            matching_zones = [z for z in self.zones.data if z.zone == target_zone]
+                            if matching_zones:
+                                closest_zone = matching_zones[0]
+                                if closest_zone.size > 0.3:  # If we're already in a valid zone
+                                    rqt = ItemRequest.Request()
+                                    rqt.robot_id = self.robot_id
+                                    try:
+                                        future = self.offload_service.call_async(rqt)
+                                        rclpy.spin_until_future_complete(self, future)
+                                        response = future.result()
+                                        if response.success:
+                                            self.get_logger().info(f'Successfully offloaded {self.current_item} item')
+                                            self.current_item = None
+                                            self.state = State.FORWARD
+                                        else:
+                                            self.get_logger().info(f'Failed to offload item: {response.message}')
+                                            self.state = State.OFFLOADING
+                                    except Exception as e:
+                                        self.get_logger().info(f'Offload service call failed: {str(e)}')
+                                        self.state = State.OFFLOADING
+                                else:
+                                    self.state = State.OFFLOADING
+                            else:
+                                self.state = State.OFFLOADING
                         else:
                             self.get_logger().info(f'Failed to pick up item: {response.message}')
                             msg.linear.x = 0.05
