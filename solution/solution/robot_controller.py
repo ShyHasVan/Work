@@ -235,7 +235,7 @@ class RobotController(Node):
         if self.state == State.COLLECTING:
             if len(self.items.data) > 0:
                 item = self.items.data[0]
-                status_msg += f', Nearest item at: ({item.x:.2f}, {item.y:.2f})'
+                status_msg += f', Nearest item at: ({item.x:.2f}, {item.y:.2f}), Color: {item.colour}'
             else:
                 status_msg += ', No items visible'
         elif self.state == State.OFFLOADING:
@@ -246,9 +246,11 @@ class RobotController(Node):
                     matching_zones = [z for z in self.zones.data if z.zone == target_zone]
                     if matching_zones:
                         zone = matching_zones[0]
-                        status_msg += f', Target zone at: ({zone.x}, {zone.y})'
+                        status_msg += f', Target zone at: ({zone.x}, {zone.y}), Size: {zone.size:.3f}'
                     else:
-                        status_msg += f', Target zone not visible'
+                        status_msg += f', Target zone ({target_zone}) not visible'
+                else:
+                    status_msg += f', No matching zone for {self.current_item}'
 
         # Log the combined status message
         self.get_logger().info(status_msg)
@@ -261,6 +263,11 @@ class RobotController(Node):
         
         match self.state:
             case State.FORWARD:
+                # If we're holding an item, prioritize going to offloading state
+                if self.current_item is not None:
+                    self.state = State.OFFLOADING
+                    return
+                
                 if self.scan_triggered[SCAN_FRONT]:
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
@@ -281,7 +288,7 @@ class RobotController(Node):
                         self.turn_direction = TURN_LEFT
                     return
                 
-                if len(self.items.data) > 0:
+                if len(self.items.data) > 0 and self.current_item is None:
                     self.state = State.COLLECTING
                     return
 
@@ -300,6 +307,15 @@ class RobotController(Node):
                     self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
 
             case State.TURNING:
+                # If we're holding an item, prioritize going to offloading state
+                if self.current_item is not None:
+                    self.state = State.OFFLOADING
+                    return
+                
+                if len(self.items.data) > 0 and self.current_item is None:
+                    self.state = State.COLLECTING
+                    return
+
                 msg = Twist()
                 msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
@@ -337,8 +353,10 @@ class RobotController(Node):
                         response = future.result()
                         if response.success:
                             self.current_item = closest_item.colour
+                            self.get_logger().info(f'Successfully picked up {self.current_item} item')
                             self.state = State.OFFLOADING
                         else:
+                            self.get_logger().info(f'Failed to pick up item: {response.message}')
                             msg.linear.x = 0.05
                             self.cmd_vel_publisher.publish(msg)
                     except Exception as e:
@@ -355,14 +373,18 @@ class RobotController(Node):
 
                 target_zone = ITEM_TO_ZONE.get(self.current_item)
                 if not target_zone:
+                    self.get_logger().info(f'No matching zone for item color: {self.current_item}, dropping item')
+                    self.current_item = None
                     self.state = State.FORWARD
                     return
 
                 matching_zones = [z for z in self.zones.data if z.zone == target_zone]
                 if not matching_zones:
-                    self.previous_pose = self.pose
-                    self.goal_distance = random.uniform(1.0, 2.0)
-                    self.state = State.FORWARD
+                    # No matching zone visible, turn to search
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = random.uniform(30, 90)
+                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
                     return
 
                 closest_zone = matching_zones[0]
@@ -383,9 +405,11 @@ class RobotController(Node):
                         rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
+                            self.get_logger().info(f'Successfully offloaded {self.current_item} item')
                             self.current_item = None
                             self.state = State.FORWARD
                         else:
+                            self.get_logger().info(f'Failed to offload item: {response.message}')
                             msg.linear.x = 0.05
                             self.cmd_vel_publisher.publish(msg)
                     except Exception as e:
