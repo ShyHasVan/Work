@@ -206,8 +206,17 @@ class RobotController(Node):
         
         match self.state:
             case State.FORWARD:
-                # If we see an item, go to COLLECTING state
-                if len(self.items.data) > 0:
+                # If holding an item, force transition to TURNING to find a zone
+                if self.holding_item:
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = 45  # Turn in increments to scan for zones
+                    self.turn_direction = TURN_LEFT
+                    self.get_logger().info("Holding item, turning to find a zone")
+                    return
+
+                # If we see an item and aren't holding one, go to COLLECTING state
+                if not self.holding_item and len(self.items.data) > 0:
                     self.state = State.COLLECTING
                     self.get_logger().info(f"Found {self.items.data[0].colour} item, moving to collect")
                     return
@@ -227,20 +236,27 @@ class RobotController(Node):
                     self.turn_direction = TURN_RIGHT if self.scan_triggered[SCAN_LEFT] else TURN_LEFT
                     return
 
-                # Move forward if no obstacles
+                # Move forward if no obstacles and not holding an item
                 msg = Twist()
                 msg.linear.x = LINEAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
 
             case State.TURNING:
-                # Check if we've found a zone
-                zone = self.find_suitable_zone()
-                if zone:
-                    self.state = State.DEPOSITING
-                    self.get_logger().info(f"Found {ZONE_COLORS.get(zone.zone, 'unknown')} zone while turning")
+                # If holding an item, prioritize finding a zone
+                if self.holding_item:
+                    zone = self.find_suitable_zone()
+                    if zone:
+                        self.state = State.DEPOSITING
+                        self.get_logger().info(f"Found {ZONE_COLORS.get(zone.zone, 'unknown')} zone while turning")
+                        return
+                    
+                    # Keep turning until we find a zone
+                    msg = Twist()
+                    msg.angular.z = ANGULAR_VELOCITY * self.turn_direction
+                    self.cmd_vel_publisher.publish(msg)
                     return
 
-                # Calculate how far we've turned
+                # Normal turning behavior for obstacle avoidance
                 angle_turned = abs(angles.normalize_angle(self.yaw - self.previous_yaw))
                 angle_to_turn = math.radians(self.turn_angle)
 
@@ -248,7 +264,6 @@ class RobotController(Node):
                     self.state = State.FORWARD
                     return
 
-                # Keep turning
                 msg = Twist()
                 msg.angular.z = ANGULAR_VELOCITY * self.turn_direction
                 self.cmd_vel_publisher.publish(msg)
