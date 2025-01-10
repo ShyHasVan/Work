@@ -41,7 +41,8 @@ ZONE_COLORS = {
 }
 
 ITEM_PICKUP_DISTANCE = 0.35
-ZONE_DEPOSIT_DISTANCE = 0.4  # Increased from 0.2 to ensure we're well inside the zone
+ZONE_DEPOSIT_DISTANCE = 0.7  # Increased to ensure we're well inside the zone
+ZONE_APPROACH_SPEED = 0.2   # Consistent approach speed
 
 class State(Enum):
     FORWARD = 0    # Moving forward, looking for items
@@ -260,21 +261,38 @@ class RobotController(Node):
                     self.get_logger().warn("Lost sight of zone, turning to find it again")
                     return
 
+                # Check for obstacles first
+                if self.scan_triggered[SCAN_FRONT]:
+                    self.get_logger().warn("Obstacle detected while approaching zone, adjusting...")
+                    msg = Twist()
+                    msg.angular.z = ANGULAR_VELOCITY * TURN_LEFT
+                    self.cmd_vel_publisher.publish(msg)
+                    return
+
                 # Navigate to zone using visual servoing
                 msg = Twist()
+                
+                # Keep moving until we're well inside the zone
                 if zone.size >= ZONE_DEPOSIT_DISTANCE:
-                    self.get_logger().info(f'Inside {ZONE_COLORS.get(zone.zone, "unknown")} zone!')
+                    self.get_logger().info(f'Fully inside {ZONE_COLORS.get(zone.zone, "unknown")} zone!')
                     # Stop once we're well inside
                     msg = Twist()
                     self.cmd_vel_publisher.publish(msg)
                     return
                 else:
-                    # Move faster when far, slower when close, but maintain minimum speed
-                    distance_factor = 1.0 - zone.size
-                    msg.linear.x = max(0.15, 0.3 * distance_factor)  # Minimum speed of 0.15
-                    msg.angular.z = zone.x / 320.0  # Center the zone in view
+                    # Use consistent forward speed but adjust turning based on zone position
+                    msg.linear.x = ZONE_APPROACH_SPEED
+                    # Stronger turning when zone is off-center
+                    turn_factor = zone.x / 320.0
+                    msg.angular.z = turn_factor * ANGULAR_VELOCITY
+                    
                     self.cmd_vel_publisher.publish(msg)
-                    self.get_logger().info(f'Moving to zone, size: {zone.size:.2f}, target size: {ZONE_DEPOSIT_DISTANCE:.2f}')
+                    self.get_logger().info(
+                        f'Moving to zone: size={zone.size:.2f}, '
+                        f'target={ZONE_DEPOSIT_DISTANCE:.2f}, '
+                        f'x_offset={zone.x}, '
+                        f'turning={msg.angular.z:.2f}'
+                    )
 
             case _:
                 self.state = State.FORWARD
