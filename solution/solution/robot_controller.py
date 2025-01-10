@@ -316,79 +316,6 @@ class RobotController(Node):
                     self.state = State.FORWARD
 
             case State.COLLECTING:
-                # If we have an item, look for the right zone
-                if self.current_item:
-                    target_zone = ITEM_TO_ZONE.get(self.current_item)
-                    if not target_zone:
-                        self.get_logger().info(f'No matching zone type for item color: {self.current_item} in mapping {ITEM_TO_ZONE}')
-                        self.current_item = None
-                        self.searching_for_zone = False
-                        return
-
-                    matching_zones = [z for z in self.zones.data if z.zone == target_zone]
-                    if matching_zones:
-                        closest_zone = matching_zones[0]
-                        self.get_logger().info(f'Found matching zone {target_zone} for {self.current_item} item')
-                        
-                        # Calculate approach to zone
-                        msg = Twist()
-                        angle_to_zone = closest_zone.x / 320.0
-                        zone_size = closest_zone.size
-
-                        if zone_size > 0.3:  # Close enough to offload
-                            msg.linear.x = 0.0
-                            msg.angular.z = 0.0
-                            self.cmd_vel_publisher.publish(msg)
-                            
-                            rqt = ItemRequest.Request()
-                            rqt.robot_id = self.robot_id
-                            try:
-                                future = self.offload_service.call_async(rqt)
-                                rclpy.spin_until_future_complete(self, future)
-                                response = future.result()
-                                if response.success:
-                                    self.get_logger().info(f'Successfully offloaded {self.current_item} item')
-                                    self.current_item = None
-                                    self.searching_for_zone = False
-                                    self.state = State.FORWARD
-                                else:
-                                    self.get_logger().info(f'Failed to offload item: {response.message}')
-                                    # Back up and try again
-                                    msg.linear.x = -0.1
-                                    self.cmd_vel_publisher.publish(msg)
-                            except Exception as e:
-                                self.get_logger().info(f'Offload service call failed: {str(e)}')
-                        else:
-                            # Approach the zone
-                            approach_speed = 0.15 if zone_size > 0.2 else 0.25
-                            msg.linear.x = approach_speed * (1.0 - zone_size)
-                            msg.angular.z = angle_to_zone
-                            self.cmd_vel_publisher.publish(msg)
-                            self.searching_for_zone = False
-                    else:
-                        # No matching zone visible, do random walk
-                        if not self.searching_for_zone:
-                            self.searching_for_zone = True
-                            self.search_start_time = self.get_clock().now()
-                            self.get_logger().info(f'Starting random walk to find zone {target_zone}')
-                        
-                        # Random walk behavior
-                        msg = Twist()
-                        current_time = self.get_clock().now()
-                        time_searching = (current_time - self.search_start_time).nanoseconds / 1e9
-                        
-                        # Change direction randomly every few seconds
-                        if time_searching % 3 < 0.1:  # Change direction every ~3 seconds
-                            self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                            self.turn_angle = random.uniform(30, 90)
-                            self.get_logger().info('Changing search direction')
-                        
-                        msg.linear.x = LINEAR_VELOCITY * 0.5  # Move forward at half speed
-                        msg.angular.z = self.turn_direction * ANGULAR_VELOCITY * 0.5  # Turn at half speed
-                        self.cmd_vel_publisher.publish(msg)
-                        return
-
-                # If we don't have an item, try to collect one
                 if len(self.items.data) == 0:
                     self.previous_pose = self.pose
                     self.goal_distance = random.uniform(1.0, 2.0)
@@ -415,7 +342,53 @@ class RobotController(Node):
                         if response.success:
                             self.current_item = closest_item.colour
                             self.get_logger().info(f'Successfully picked up {self.current_item} item')
-                            self.searching_for_zone = False
+                            
+                            # Try to offload immediately after pickup
+                            target_zone = ITEM_TO_ZONE.get(self.current_item)
+                            if not target_zone:
+                                self.get_logger().info(f'No matching zone type for item color: {self.current_item} in mapping {ITEM_TO_ZONE}')
+                                self.current_item = None
+                                return
+
+                            matching_zones = [z for z in self.zones.data if z.zone == target_zone]
+                            if matching_zones:
+                                closest_zone = matching_zones[0]
+                                self.get_logger().info(f'Found matching zone {target_zone} for {self.current_item} item')
+                                
+                                if closest_zone.size > 0.3:  # Close enough to offload
+                                    rqt = ItemRequest.Request()
+                                    rqt.robot_id = self.robot_id
+                                    try:
+                                        future = self.offload_service.call_async(rqt)
+                                        rclpy.spin_until_future_complete(self, future)
+                                        response = future.result()
+                                        if response.success:
+                                            self.get_logger().info(f'Successfully offloaded {self.current_item} item')
+                                            self.current_item = None
+                                            self.state = State.FORWARD
+                                        else:
+                                            self.get_logger().info(f'Failed to offload item: {response.message}')
+                                            # Start random walk to find another zone
+                                            msg.linear.x = LINEAR_VELOCITY * 0.5
+                                            msg.angular.z = random.choice([TURN_LEFT, TURN_RIGHT]) * ANGULAR_VELOCITY * 0.5
+                                            self.cmd_vel_publisher.publish(msg)
+                                    except Exception as e:
+                                        self.get_logger().info(f'Offload service call failed: {str(e)}')
+                                else:
+                                    # Zone visible but not close enough, approach it
+                                    msg = Twist()
+                                    angle_to_zone = closest_zone.x / 320.0
+                                    approach_speed = 0.15 if closest_zone.size > 0.2 else 0.25
+                                    msg.linear.x = approach_speed * (1.0 - closest_zone.size)
+                                    msg.angular.z = angle_to_zone
+                                    self.cmd_vel_publisher.publish(msg)
+                            else:
+                                # No matching zone visible, start random walk
+                                self.get_logger().info(f'No matching zone visible for {self.current_item}, starting random walk')
+                                msg = Twist()
+                                msg.linear.x = LINEAR_VELOCITY * 0.5
+                                msg.angular.z = random.choice([TURN_LEFT, TURN_RIGHT]) * ANGULAR_VELOCITY * 0.5
+                                self.cmd_vel_publisher.publish(msg)
                         else:
                             self.get_logger().info(f'Failed to pick up item: {response.message}')
                             msg.linear.x = 0.05
