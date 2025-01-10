@@ -372,11 +372,24 @@ class RobotController(Node):
                                     msg.angular.z = angle_to_zone
                                     self.cmd_vel_publisher.publish(msg)
                             else:
-                                # No zones visible, do a slow turn to search
+                                # Start turning to search for zones
+                                self.get_logger().info('No zones visible, turning to search')
                                 msg = Twist()
                                 msg.linear.x = 0.0
                                 msg.angular.z = ANGULAR_VELOCITY * 0.5
                                 self.cmd_vel_publisher.publish(msg)
+                                # Wait a bit to let the turn happen
+                                rclpy.sleep(0.5)
+                                # Check if we can see a zone after turning
+                                if len(self.zones.data) > 0:
+                                    closest_zone = self.zones.data[0]
+                                    self.get_logger().info(f'Found a zone after turning, moving to it')
+                                    msg = Twist()
+                                    angle_to_zone = closest_zone.x / 320.0
+                                    approach_speed = 0.15 if closest_zone.size > 0.2 else 0.25
+                                    msg.linear.x = approach_speed * (1.0 - closest_zone.size)
+                                    msg.angular.z = angle_to_zone
+                                    self.cmd_vel_publisher.publish(msg)
                         else:
                             self.get_logger().info(f'Failed to pick up item: {response.message}')
                             msg.linear.x = 0.05
