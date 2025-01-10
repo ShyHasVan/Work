@@ -346,9 +346,17 @@ class RobotController(Node):
                             # After successful pickup, check for zones
                             if len(self.zones.data) > 0:
                                 closest_zone = self.zones.data[0]
-                                self.get_logger().info(f'Found a zone, size: {closest_zone.size:.3f}, x: {closest_zone.x}')
+                                self.get_logger().info(f'Found a zone, moving to it')
                                 
-                                if closest_zone.size > 0.3:  # Close enough to offload
+                                # Zone visible, approach it
+                                msg = Twist()
+                                angle_to_zone = closest_zone.x / 320.0
+                                msg.linear.x = 0.2  # Fixed forward speed
+                                msg.angular.z = angle_to_zone
+                                self.cmd_vel_publisher.publish(msg)
+                                
+                                # If close enough, try to offload
+                                if closest_zone.size > 0.3:
                                     rqt = ItemRequest.Request()
                                     rqt.robot_id = self.robot_id
                                     try:
@@ -363,31 +371,26 @@ class RobotController(Node):
                                             self.get_logger().info(f'Failed to offload item: {response.message}')
                                     except Exception as e:
                                         self.get_logger().info(f'Offload service call failed: {str(e)}')
-                                else:
-                                    # Zone visible but not close enough, approach it
-                                    msg = Twist()
-                                    angle_to_zone = closest_zone.x / 320.0
-                                    approach_speed = 0.15 if closest_zone.size > 0.2 else 0.25
-                                    msg.linear.x = approach_speed * (1.0 - closest_zone.size)
-                                    msg.angular.z = angle_to_zone
-                                    self.cmd_vel_publisher.publish(msg)
                             else:
-                                # Start turning to search for zones
-                                self.get_logger().info('No zones visible, turning to search')
+                                # No zones visible, turn in place
                                 msg = Twist()
                                 msg.linear.x = 0.0
-                                msg.angular.z = ANGULAR_VELOCITY * 0.5
+                                msg.angular.z = ANGULAR_VELOCITY
                                 self.cmd_vel_publisher.publish(msg)
-                                # Wait a bit to let the turn happen
-                                rclpy.sleep(0.5)
-                                # Check if we can see a zone after turning
+                                
+                                # Check if we see a zone after starting to turn
                                 if len(self.zones.data) > 0:
+                                    # Stop turning
+                                    msg = Twist()
+                                    msg.angular.z = 0.0
+                                    self.cmd_vel_publisher.publish(msg)
+                                    
+                                    # Move to the zone
                                     closest_zone = self.zones.data[0]
                                     self.get_logger().info(f'Found a zone after turning, moving to it')
                                     msg = Twist()
                                     angle_to_zone = closest_zone.x / 320.0
-                                    approach_speed = 0.15 if closest_zone.size > 0.2 else 0.25
-                                    msg.linear.x = approach_speed * (1.0 - closest_zone.size)
+                                    msg.linear.x = 0.2  # Fixed forward speed
                                     msg.angular.z = angle_to_zone
                                     self.cmd_vel_publisher.publish(msg)
                         else:
