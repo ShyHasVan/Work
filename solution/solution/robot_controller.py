@@ -304,14 +304,16 @@ class RobotController(Node):
                                 self.get_logger().info(f'Successfully picked up {item.colour} item')
                                 self.holding_item = True
                                 self.held_item_color = item.colour
+                                # Stop moving but ensure we transition to TURNING
                                 msg = Twist()
                                 self.cmd_vel_publisher.publish(msg)
-                                # Immediately start searching for a zone
+                                # Set up turning to find a zone
                                 self.previous_yaw = self.yaw
                                 self.state = State.TURNING
                                 self.turn_angle = 45
                                 self.turn_direction = TURN_LEFT
                                 self.get_logger().info("Item picked up, switching to TURNING to find a zone")
+                                return  # Return here to ensure next control_loop handles turning
                             else:
                                 self.get_logger().warn(f'Failed to pick up: {response.message}')
                                 self.state = State.FORWARD
