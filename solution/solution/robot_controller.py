@@ -97,6 +97,12 @@ class RobotController(Node):
             callback_group=client_cb_group
         )
 
+        # Wait for services to be available
+        while not self.pick_up_service.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Pick up service not available, waiting...')
+        while not self.offload_service.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Offload service not available, waiting...')
+
         # Subscribers
         self.item_subscriber = self.create_subscription(
             ItemList,
@@ -149,6 +155,8 @@ class RobotController(Node):
             self.control_loop,
             callback_group=timer_cb_group
         )
+        
+        self.get_logger().info('Robot controller initialized')
 
     def item_callback(self, msg):
         self.items = msg
