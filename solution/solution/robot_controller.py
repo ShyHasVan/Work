@@ -356,10 +356,10 @@ class RobotController(Node):
                             self.current_item = closest_item.colour
                             self.get_logger().info(f'Successfully picked up {self.current_item} item')
                             
-                            # Immediately try to offload after successful pickup
+                            # After pickup, search for the correct zone
                             target_zone = ITEM_TO_ZONE.get(self.current_item)
                             if not target_zone:
-                                self.get_logger().info(f'No matching zone for item color: {self.current_item}, dropping item')
+                                self.get_logger().info(f'No matching zone type for item color: {self.current_item} in mapping {ITEM_TO_ZONE}')
                                 self.current_item = None
                                 self.state = State.FORWARD
                                 return
@@ -367,6 +367,7 @@ class RobotController(Node):
                             matching_zones = [z for z in self.zones.data if z.zone == target_zone]
                             if matching_zones:
                                 closest_zone = matching_zones[0]
+                                self.get_logger().info(f'Found matching zone {target_zone} for {self.current_item} item')
                                 if closest_zone.size > 0.3:  # If we're already in a valid zone
                                     rqt = ItemRequest.Request()
                                     rqt.robot_id = self.robot_id
@@ -387,6 +388,32 @@ class RobotController(Node):
                                 else:
                                     self.state = State.OFFLOADING
                             else:
+                                # No matching zone visible, start searching by turning
+                                self.get_logger().info(f'No matching zone visible for {self.current_item} item, starting search')
+                                msg = Twist()
+                                msg.angular.z = ANGULAR_VELOCITY  # Start turning to search for zone
+                                self.cmd_vel_publisher.publish(msg)
+                                
+                                # Keep turning until we see the zone or complete a full rotation
+                                search_start_time = self.get_clock().now()
+                                while len([z for z in self.zones.data if z.zone == target_zone]) == 0:
+                                    # Check if we've completed a full rotation (approximately 6.28 radians)
+                                    if (self.get_clock().now() - search_start_time).nanoseconds / 1e9 > (2 * math.pi / ANGULAR_VELOCITY):
+                                        break
+                                    rclpy.spin_once(self, timeout_sec=0.1)
+                                
+                                # Stop turning
+                                msg.angular.z = 0.0
+                                self.cmd_vel_publisher.publish(msg)
+                                
+                                # If we still haven't found the zone, move forward and try again
+                                if len([z for z in self.zones.data if z.zone == target_zone]) == 0:
+                                    msg.linear.x = LINEAR_VELOCITY
+                                    self.cmd_vel_publisher.publish(msg)
+                                    rclpy.sleep(1.0)  # Move forward for 1 second
+                                    msg.linear.x = 0.0
+                                    self.cmd_vel_publisher.publish(msg)
+                                
                                 self.state = State.OFFLOADING
                         else:
                             self.get_logger().info(f'Failed to pick up item: {response.message}')
