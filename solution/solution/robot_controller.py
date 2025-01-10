@@ -54,10 +54,6 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Store executor for service calls
-        self.executor = rclpy.executors.MultiThreadedExecutor()
-        self.executor.add_node(self)
-
         # Robot state
         self.state = State.FORWARD
         self.pose = Pose()
@@ -346,7 +342,7 @@ class RobotController(Node):
                             self.state = State.FORWARD
                             return
                             
-                        self.executor.spin_until_future_complete(future)
+                        rclpy.spin_until_future_complete(self, future)
                         if future.done():
                             response = future.result()
                             if response.success:
@@ -385,9 +381,13 @@ class RobotController(Node):
 
 def main(args=None):
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    
     node = RobotController()
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
+    
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     except ExternalShutdownException:
