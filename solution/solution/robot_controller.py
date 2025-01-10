@@ -348,7 +348,13 @@ class RobotController(Node):
                                 closest_zone = self.zones.data[0]
                                 self.get_logger().info(f'Found a zone, moving to it')
                                 
-                                # Zone visible, approach it
+                                # First stop any movement
+                                msg = Twist()
+                                msg.linear.x = 0.0
+                                msg.angular.z = 0.0
+                                self.cmd_vel_publisher.publish(msg)
+                                
+                                # Then start moving to zone
                                 msg = Twist()
                                 angle_to_zone = closest_zone.x / 320.0
                                 msg.linear.x = 0.2  # Fixed forward speed
@@ -372,20 +378,28 @@ class RobotController(Node):
                                     except Exception as e:
                                         self.get_logger().info(f'Offload service call failed: {str(e)}')
                             else:
-                                # No zones visible, turn in place
+                                # No zones visible, start turning
+                                self.get_logger().info('No zones visible, turning to search')
                                 msg = Twist()
                                 msg.linear.x = 0.0
                                 msg.angular.z = ANGULAR_VELOCITY
                                 self.cmd_vel_publisher.publish(msg)
                                 
-                                # Check if we see a zone after starting to turn
+                                # Wait a bit to let messages process
+                                rclpy.sleep(0.2)
+                                
+                                # Check if we see a zone
                                 if len(self.zones.data) > 0:
-                                    # Stop turning
+                                    # First make sure we stop
                                     msg = Twist()
+                                    msg.linear.x = 0.0
                                     msg.angular.z = 0.0
                                     self.cmd_vel_publisher.publish(msg)
                                     
-                                    # Move to the zone
+                                    # Wait a bit to ensure stop message is processed
+                                    rclpy.sleep(0.2)
+                                    
+                                    # Then move to the zone
                                     closest_zone = self.zones.data[0]
                                     self.get_logger().info(f'Found a zone after turning, moving to it')
                                     msg = Twist()
