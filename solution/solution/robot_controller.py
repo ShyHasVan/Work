@@ -352,9 +352,9 @@ class RobotController(Node):
                         rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
+                            self.state = State.OFFLOADING
                             self.current_item = closest_item.colour
                             self.get_logger().info(f'Successfully picked up {self.current_item} item')
-                            self.state = State.OFFLOADING
                         else:
                             self.get_logger().info(f'Failed to pick up item: {response.message}')
                             msg.linear.x = 0.05
@@ -392,6 +392,8 @@ class RobotController(Node):
 
                 angle_to_zone = closest_zone.x / 320.0
                 zone_size = closest_zone.size
+
+                self.get_logger().info(f'Approaching zone: {target_zone}, Angle: {angle_to_zone:.2f}, Size: {zone_size:.2f}')
 
                 if zone_size > 0.3:
                     msg.linear.x = 0.0
