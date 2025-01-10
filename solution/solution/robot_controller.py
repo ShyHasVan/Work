@@ -54,6 +54,10 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
+        # Store executor for service calls
+        self.executor = rclpy.executors.MultiThreadedExecutor()
+        self.executor.add_node(self)
+
         # Robot state
         self.state = State.FORWARD
         self.pose = Pose()
@@ -205,6 +209,11 @@ class RobotController(Node):
         self.get_logger().info(f"STATE: {self.state}, Holding item: {self.holding_item}, "
                              f"Item color: {self.held_item_color}, Zones visible: {len(self.zones.data)}")
         
+        # Stop moving if transitioning states
+        if self.state != State.FORWARD and self.state != State.COLLECTING:
+            msg = Twist()
+            self.cmd_vel_publisher.publish(msg)
+
         match self.state:
             case State.FORWARD:
                 # If holding an item, force transition to TURNING to find a zone
@@ -337,13 +346,16 @@ class RobotController(Node):
                             self.state = State.FORWARD
                             return
                             
-                        rclpy.spin_until_future_complete(self, future)
+                        self.executor.spin_until_future_complete(future)
                         if future.done():
                             response = future.result()
                             if response.success:
                                 self.get_logger().info(f'Successfully picked up {item.colour} item')
                                 self.holding_item = True
                                 self.held_item_color = item.colour
+                                # Stop moving immediately
+                                msg = Twist()
+                                self.cmd_vel_publisher.publish(msg)
                                 # After pickup, go to TURNING to find a zone
                                 self.previous_yaw = self.yaw
                                 self.state = State.TURNING
