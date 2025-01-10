@@ -41,7 +41,7 @@ ZONE_COLORS = {
 }
 
 ITEM_PICKUP_DISTANCE = 0.35
-ZONE_DEPOSIT_DISTANCE = 0.7  # Increased to ensure we're well inside the zone
+ZONE_DEPOSIT_DISTANCE = 1.0  # Increased to ensure we're well inside the zone
 ZONE_APPROACH_SPEED = 0.2   # Consistent approach speed
 
 class State(Enum):
