@@ -321,7 +321,7 @@ class RobotController(Node):
                             self.get_logger().info(f'Picked up {item.colour} item')
                             self.holding_item = True
                             self.held_item_color = item.colour
-                            self.state = State.FORWARD  # Go back to FORWARD to find a zone
+                            self.state = State.DEPOSITING  # Go back to Deposit to find a zone
                         else:
                             self.get_logger().info('Failed to pick up: ' + response.message)
                     except Exception as e:
