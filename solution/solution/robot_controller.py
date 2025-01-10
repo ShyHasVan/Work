@@ -44,6 +44,13 @@ ITEM_PICKUP_DISTANCE = 0.35
 ZONE_DEPOSIT_DISTANCE = 1.0  # Increased to ensure we're well inside the zone
 ZONE_APPROACH_SPEED = 0.2   # Consistent approach speed
 
+# Add color mappings at the top with other constants
+ITEM_TO_ZONE = {
+    "red": Zone.ZONE_GREEN,     # Red items go to green zone
+    "green": Zone.ZONE_PURPLE,  # Green items go to purple zone
+    "blue": Zone.ZONE_CYAN      # Blue items go to cyan zone
+}
+
 class State(Enum):
     FORWARD = 0    # Moving forward, looking for items
     TURNING = 1    # Turning to avoid obstacles or find zones
@@ -174,26 +181,27 @@ class RobotController(Node):
         self.scan_triggered[SCAN_RIGHT] = min(right_ranges) < SCAN_THRESHOLD
 
     def find_suitable_zone(self):
-        """Find a visible zone"""
-        if not self.zones.data:
+        """Find a zone matching our held item's color"""
+        if not self.zones.data or not self.holding_item:
             return None
         
-        # Log all visible zones for debugging
+        # Get the target zone type for our held item
+        target_zone = ITEM_TO_ZONE.get(self.held_item_color)
+        if not target_zone:
+            self.get_logger().warn(f"No target zone defined for {self.held_item_color} items")
+            return None
+
+        # Find matching zone
         for zone in self.zones.data:
-            self.get_logger().info(f"Zone: {ZONE_COLORS.get(zone.zone, 'unknown')}, "
-                                 f"size: {zone.size:.2f}, x: {zone.x}, y: {zone.y}")
+            if zone.zone == target_zone:
+                self.get_logger().info(
+                    f"Found matching zone for {self.held_item_color} item: "
+                    f"{ZONE_COLORS.get(zone.zone, 'unknown')}, "
+                    f"size: {zone.size:.2f}, position: ({zone.x}, {zone.y})"
+                )
+                return zone
         
-        # Return the largest visible zone (closest to robot)
-        largest_zone = max(self.zones.data, key=lambda z: z.size) if self.zones.data else None
-        
-        if largest_zone:
-            self.get_logger().info(
-                f"Selected zone: {ZONE_COLORS.get(largest_zone.zone, 'unknown')}, "
-                f"size: {largest_zone.size:.2f}, "
-                f"position: ({largest_zone.x}, {largest_zone.y})"
-            )
-            
-        return largest_zone
+        return None
 
     def control_loop(self):
         # Update marker for visualization
@@ -202,7 +210,8 @@ class RobotController(Node):
         marker.pose = self.pose
         self.marker_publisher.publish(marker)
 
-        self.get_logger().info(f"STATE: {self.state}, Zones visible: {len(self.zones.data)}")
+        self.get_logger().info(f"STATE: {self.state}, Holding: {self.held_item_color if self.holding_item else 'None'}, "
+                             f"Zones visible: {len(self.zones.data)}")
         
         match self.state:
             case State.FORWARD:
@@ -284,20 +293,26 @@ class RobotController(Node):
                 self.cmd_vel_publisher.publish(msg)
 
             case State.DEPOSITING:
+                # First try to find our target zone
                 zone = self.find_suitable_zone()
                 if not zone:
+                    # If no matching zone found, turn in place to search
+                    self.get_logger().info(f"Searching for zone for {self.held_item_color} item...")
                     msg = Twist()
-                    msg.angular.z = ANGULAR_VELOCITY  # Keep turning to find a zone
+                    msg.angular.z = ANGULAR_VELOCITY
                     self.cmd_vel_publisher.publish(msg)
                     return
 
-                # Navigate to zone using visual servoing
+                # Once we see our target zone, move towards it
+                self.get_logger().info(f"Moving to zone, size: {zone.size:.2f}, x_offset: {zone.x}")
                 msg = Twist()
                 msg.linear.x = ZONE_APPROACH_SPEED
                 msg.angular.z = zone.x / 320.0
                 self.cmd_vel_publisher.publish(msg)
 
+                # When close enough, try to deposit
                 if zone.size >= ZONE_DEPOSIT_DISTANCE:
+                    self.get_logger().info("In zone, attempting to deposit...")
                     request = ItemRequest.Request()
                     request.robot_id = self.robot_id
                     try:
@@ -305,24 +320,26 @@ class RobotController(Node):
                         rclpy.spin_until_future_complete(self, future)
                         response = future.result()
                         if response.success:
-                            self.get_logger().info(f'Deposited {self.held_item_color} item')
+                            self.get_logger().info(f'Successfully deposited {self.held_item_color} item')
                             self.holding_item = False
                             self.held_item_color = None
                             self.state = State.FORWARD
                         else:
                             self.get_logger().warn(f'Failed to deposit: {response.message}')
+                            # Keep trying if deposit fails
                     except Exception as e:
                         self.get_logger().error(f'Service call failed: {e}')
                     return
 
-            case _:
-                self.state = State.FORWARD
-
 def main(args=None):
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    
     node = RobotController()
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
+    
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     except ExternalShutdownException:
