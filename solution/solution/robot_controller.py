@@ -206,19 +206,10 @@ class RobotController(Node):
         
         match self.state:
             case State.FORWARD:
-                # First priority: Look for items if not holding one
-                if not self.holding_item and len(self.items.data) > 0:
+                # First check for items
+                if len(self.items.data) > 0:
                     self.state = State.COLLECTING
-                    self.get_logger().info(f"Found {self.items.data[0].colour} item, moving to collect")
                     return
-
-                # Second priority: Look for zones if holding an item
-                if self.holding_item:
-                    zone = self.find_suitable_zone()
-                    if zone:
-                        self.state = State.DEPOSITING
-                        self.get_logger().info(f"Found {ZONE_COLORS.get(zone.zone, 'unknown')} zone, moving to deposit")
-                        return
 
                 # Handle obstacles like week 5
                 if self.scan_triggered[SCAN_FRONT]:
@@ -303,12 +294,15 @@ class RobotController(Node):
 
             case State.COLLECTING:
                 if len(self.items.data) == 0:
+                    self.previous_pose = self.pose
                     self.state = State.FORWARD
                     return
                 
                 item = self.items.data[0]
                 # Use week 5's proven collection logic
                 estimated_distance = 32.4 * float(item.diameter) ** -0.75
+
+                self.get_logger().info(f'Estimated distance {estimated_distance}')
 
                 if estimated_distance <= ITEM_PICKUP_DISTANCE:
                     request = ItemRequest.Request()
@@ -321,7 +315,8 @@ class RobotController(Node):
                             self.get_logger().info(f'Picked up {item.colour} item')
                             self.holding_item = True
                             self.held_item_color = item.colour
-                            self.state = State.DEPOSITING  # Go back to Deposit to find a zone
+                            self.items.data = []  # Clear items like week 5
+                            self.state = State.DEPOSITING  # Go straight to depositing
                         else:
                             self.get_logger().info('Failed to pick up: ' + response.message)
                     except Exception as e:
