@@ -344,6 +344,7 @@ class RobotController(Node):
                             self.get_logger().info('Successfully picked up item!')
                             self.current_item = closest_item.colour
                             self.state = State.OFFLOADING
+                            return
                         else:
                             self.get_logger().info('Failed to pick up item: ' + response.message)
                             # Move slightly closer if pickup failed
