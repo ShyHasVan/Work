@@ -376,8 +376,7 @@ class RobotController(Node):
 
                 # Calculate distance to item
                 estimated_distance = 32.4 * float(item.diameter) ** -0.75
-                self.get_logger().info(f'Estimated distance {estimated_distance}')
-
+            
                 # Try pickup if close enough
                 if estimated_distance <= 0.35:
                     rqt = ItemRequest.Request()
