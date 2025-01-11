@@ -62,9 +62,9 @@ class State(Enum):
 
 # Map item colors to zones with their map coordinates
 ZONE_POSITIONS = {
-    'ZONE_PINK': {'x': 2.0, 'y': 2.0},
-    'ZONE_GREEN': {'x': 2.0, 'y': -2.0},
-    'ZONE_PURPLE': {'x': -2.0, 'y': 2.0}
+    'ZONE_PINK': {'x': 2.5, 'y': 2.5},    # Move slightly further to ensure we're inside
+    'ZONE_GREEN': {'x': 2.5, 'y': -2.5},   # Move slightly further to ensure we're inside
+    'ZONE_PURPLE': {'x': -2.5, 'y': 2.5}   # Move slightly further to ensure we're inside
 }
 
 # Map item colors to zones
