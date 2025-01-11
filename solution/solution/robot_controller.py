@@ -93,7 +93,6 @@ class RobotController(Node):
         self.items = ItemList()
         self.zones = ZoneList()
         self.current_zone_target = None
-        self.executor = MultiThreadedExecutor()  # Store executor as instance variable
 
         # Get robot_id parameter first
         self.declare_parameter('robot_id', 'robot1')
@@ -475,15 +474,17 @@ def main(args=None):
     rclpy.init(args = args, signal_handler_options = SignalHandlerOptions.NO)
 
     node = RobotController()
-    node.executor.add_node(node)  # Use the instance executor
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
 
     try:
-        node.executor.spin()  # Use the instance executor
+        executor.spin()
     except KeyboardInterrupt:
         pass
     except ExternalShutdownException:
         sys.exit(1)
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.try_shutdown()
 
