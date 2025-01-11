@@ -364,14 +364,21 @@ class RobotController(Node):
                         if response.success:
                             self.get_logger().info('Item picked up.')
                             # After pickup, set target zone and switch to navigation
-                            target_zone = ITEM_TO_ZONE.get(item.colour)
+                            target_zone = ITEM_TO_ZONE.get(item.colour.upper())  # Convert to uppercase to match the mapping
                             if target_zone:
                                 self.current_zone_target = target_zone
                                 self.state = State.NAVIGATING_TO_ZONE
+                                self.get_logger().info(f'Moving to {target_zone} with {item.colour} item')
+                                return  # Important: return here to prevent further movement
+                            else:
+                                self.get_logger().info(f'No zone mapping for item color: {item.colour}')
+                                self.state = State.FORWARD
+                            self.items.data = []  # Clear the items list after pickup
+                            return
                         else:
                             self.get_logger().info('Unable to pick up item: ' + response.message)
                     except Exception as e:
-                        self.get_logger().info('Exception ' + e)   
+                        self.get_logger().info('Exception during pickup: ' + str(e))   
 
                 msg = Twist()
                 msg.linear.x = 0.25 * estimated_distance
@@ -379,18 +386,21 @@ class RobotController(Node):
                 self.cmd_vel_publisher.publish(msg)
 
             case State.NAVIGATING_TO_ZONE:
+                if not self.current_zone_target:
+                    self.state = State.FORWARD
+                    return
 
                 zone_pose = self.get_zone_pose(self.current_zone_target)
                 if not zone_pose:
                     self.get_logger().info(f'Cannot find target zone {self.current_zone_target}')
-                    self.state = State.FORWARD
-                    return
+                    return  # Keep trying to find the zone
 
-                # Send the goal pose to Nav2
-                self.navigator.goToPose(zone_pose)
-                self.get_logger().info(f'Navigating to {self.current_zone_target}')
+                # Only send the goal pose if we haven't started navigation yet
+                if not self.navigator.isTaskActive():
+                    self.navigator.goToPose(zone_pose)
+                    self.get_logger().info(f'Started navigation to {self.current_zone_target}')
 
-                # Check if we're still navigating
+                # Check navigation status
                 if not self.navigator.isTaskComplete():
                     feedback = self.navigator.getFeedback()
                     if feedback:
