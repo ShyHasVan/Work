@@ -385,8 +385,25 @@ class RobotController(Node):
                         self.get_logger().info('Exception during pickup: ' + str(e))   
 
                 msg = Twist()
-                msg.linear.x = 0.25 * estimated_distance
-                msg.angular.z = item.x / 320.0
+                
+                # Check for obstacles while approaching item
+                if self.scan_triggered[SCAN_FRONT]:
+                    # If obstacle directly in front, try to maneuver around it
+                    if not self.scan_triggered[SCAN_LEFT]:
+                        msg.angular.z = ANGULAR_VELOCITY  # Turn left if left is clear
+                        self.get_logger().info('Obstacle in front while collecting, turning left')
+                    elif not self.scan_triggered[SCAN_RIGHT]:
+                        msg.angular.z = -ANGULAR_VELOCITY  # Turn right if right is clear
+                        self.get_logger().info('Obstacle in front while collecting, turning right')
+                    else:
+                        # If both sides blocked, back up slightly and try again
+                        msg.linear.x = -0.1
+                        self.get_logger().info('Obstacles all around while collecting, backing up')
+                else:
+                    # No obstacles, proceed towards item
+                    msg.linear.x = 0.25 * estimated_distance
+                    msg.angular.z = item.x / 320.0  # Original item tracking behavior
+                
                 self.cmd_vel_publisher.publish(msg)
 
             case State.SET_GOAL:
