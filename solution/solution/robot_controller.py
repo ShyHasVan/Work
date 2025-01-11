@@ -61,10 +61,9 @@ class State(Enum):
 
 # Map item colors to zones
 ITEM_TO_ZONE = {
-    'red': 'ZONE_CYAN',
-    'green': 'ZONE_GREEN',
-    'blue': 'ZONE_PURPLE',
-    'yellow': 'ZONE_PINK'
+    'RED': 'ZONE_CYAN',     # Red items go to cyan zone
+    'GREEN': 'ZONE_GREEN',  # Green items go to green zone
+    'BLUE': 'ZONE_PURPLE'   # Blue items go to purple zone
 }
 
 class RobotController(Node):
