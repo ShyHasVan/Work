@@ -1,3 +1,4 @@
+
 #
 # Copyright (c) 2024 University of York and others
 #
@@ -80,10 +81,6 @@ class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         
-        # Get robot_id parameter first - we need this for all namespacing
-        self.declare_parameter('robot_id', 'robot1')
-        self.robot_id = self.get_parameter('robot_id').value
-
         # Class variables used to store persistent values between executions of callbacks and control loop
         self.state = State.FORWARD # Current FSM state
         self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
@@ -98,31 +95,15 @@ class RobotController(Node):
         self.zones = ZoneList()
         self.current_zone_target = None
 
-        # Here we use two callback groups, to ensure that those in 'client_callback_group' can be executed
-        # independently from those in 'timer_callback_group'. This allows calling the services below within
-        # a callback handled by the timer_callback_group.
-        self.client_callback_group = MutuallyExclusiveCallbackGroup()
-        self.timer_callback_group = MutuallyExclusiveCallbackGroup()
-
-        # Initialize navigation with proper namespace
+        # Initialize navigation
         self.navigator = BasicNavigator()
         
         # Set initial pose for navigation
         initial_pose = PoseStamped()
         initial_pose.header.frame_id = 'map'
         initial_pose.header.stamp = self.get_clock().now().to_msg()
-        
-        # Spread robots around the starting area
-        if self.robot_id == 'robot1':
-            initial_pose.pose.position.x = -3.5
-            initial_pose.pose.position.y = 2.0
-        elif self.robot_id == 'robot2':
-            initial_pose.pose.position.x = -3.5
-            initial_pose.pose.position.y = 0.0
-        else:  # robot3
-            initial_pose.pose.position.x = -3.5
-            initial_pose.pose.position.y = -2.0
-            
+        initial_pose.pose.position.x = -3.5
+        initial_pose.pose.position.y = 0.0
         initial_pose.pose.orientation.z = 0.0
         initial_pose.pose.orientation.w = 1.0
         self.navigator.setInitialPose(initial_pose)
@@ -130,84 +111,83 @@ class RobotController(Node):
         # Wait for navigation to be ready
         self.navigator.waitUntilNav2Active()
 
-        # Create service clients in client callback group
-        self.pick_up_service = self.create_client(
-            ItemRequest, 
-            f'/{self.robot_id}/pick_up_item', 
-            callback_group=self.client_callback_group
-        )
-        self.offload_service = self.create_client(
-            ItemRequest, 
-            f'/{self.robot_id}/offload_item', 
-            callback_group=self.client_callback_group
-        )
+        self.declare_parameter('robot_id', 'robot1')
+        self.robot_id = self.get_parameter('robot_id').value
 
-        # Create subscribers in timer callback group
+        # Here we use two callback groups, to ensure that those in 'client_callback_group' can be executed
+        # independently from those in 'timer_callback_group'. This allos calling the services below within
+        # a callback handled by the timer_callback_group. See https://docs.ros.org/en/humble/How-To-Guides/Using-callback-groups.html
+        # for a detailed discussion on the ROS executors and callback groups.
+        client_callback_group = MutuallyExclusiveCallbackGroup()
+        timer_callback_group = MutuallyExclusiveCallbackGroup()
+
+        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
+        self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
+
         self.item_subscriber = self.create_subscription(
             ItemList,
-            f'/{self.robot_id}/items',
+            'items',
             self.item_callback,
-            10, 
-            callback_group=self.timer_callback_group
+            10, callback_group=timer_callback_group
         )
 
         self.zone_subscriber = self.create_subscription(
             ZoneList,
-            f'/{self.robot_id}/zone',
+            'zone',
             self.zone_callback,
-            10, 
-            callback_group=self.timer_callback_group
+            10, callback_group=timer_callback_group
         )
 
+        # Subscribes to Odometry messages published on /odom topic
+        # http://docs.ros.org/en/noetic/api/nav_msgs/html/msg/Odometry.html
+        #
+        # Final argument can either be an integer representing the history depth, or a Quality of Service (QoS) profile
+        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1335-L1338
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1187-L1196
+        #
+        # If you only specify a history depth, rclpy defaults to QoSHistoryPolicy.KEEP_LAST
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L80-L83
         self.odom_subscriber = self.create_subscription(
             Odometry,
-            f'/{self.robot_id}/odom',
+            'odom',
             self.odom_callback,
-            10, 
-            callback_group=self.timer_callback_group
-        )
+            10, callback_group=timer_callback_group)
         
+        # Subscribes to LaserScan messages on the /scan topic
+        # http://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/LaserScan.html
+        #
+        # QoSPresetProfiles.SENSOR_DATA specifices "best effort" reliability and a small queue size
+        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L455
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L428-L431
         self.scan_subscriber = self.create_subscription(
             LaserScan,
-            f'/{self.robot_id}/scan',
+            'scan',
             self.scan_callback,
-            QoSPresetProfiles.SENSOR_DATA.value, 
-            callback_group=self.timer_callback_group
-        )
+            QoSPresetProfiles.SENSOR_DATA.value, callback_group=timer_callback_group)
 
-        # Create publishers
-        self.cmd_vel_publisher = self.create_publisher(
-            Twist, 
-            f'/{self.robot_id}/cmd_vel',
-            10
-        )
+        # Publishes Twist messages (linear and angular velocities) on the /cmd_vel topic
+        # http://docs.ros.org/en/noetic/api/geometry_msgs/html/msg/Twist.html
+        # 
+        # Gazebo ROS differential drive plugin subscribes to these messages, and converts them into left and right wheel speeds
+        # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L537-L555
+        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
 
-        self.marker_publisher = self.create_publisher(
-            StringWithPose, 
-            f'/{self.robot_id}/marker_input',
-            10, 
-            callback_group=self.timer_callback_group
-        )
+        #self.orientation_publisher = self.create_publisher(Float32, '/orientation', 10)
 
-        # Create timer in timer callback group
+        # Publishes custom StringWithPose (see auro_interfaces/msg/StringWithPose.msg) messages on the /marker_input topic
+        # The week3/rviz_text_marker node subscribes to these messages, and ouputs a Marker message on the /marker_output topic
+        # ros2 run week_3 rviz_text_marker
+        # This can be visualised in RViz: Add > By topic > /marker_output
+        #
+        # http://docs.ros.org/en/noetic/api/visualization_msgs/html/msg/Marker.html
+        # http://wiki.ros.org/rviz/DisplayTypes/Marker
+        self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10, callback_group=timer_callback_group)
+
+        # Creates a timer that calls the control_loop method repeatedly - each loop represents single iteration of the FSM
         self.timer_period = 0.1 # 100 milliseconds = 10 Hz
-        self.timer = self.create_timer(
-            self.timer_period, 
-            self.control_loop, 
-            callback_group=self.timer_callback_group
-        )
-
-    def call_service(self, service_client, request):
-        """Helper method to call services using callback groups properly"""
-        while not service_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info(f'Service {service_client.srv_name} not available, waiting...')
-            
-        future = service_client.call_async(request)
-        
-        # Use spin_until_future_complete instead of manual spinning
-        rclpy.spin_until_future_complete(self, future)
-        
-        return future.result()
+        self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
 
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
@@ -366,23 +346,28 @@ class RobotController(Node):
                 if estimated_distance <= 0.35:
                     rqt = ItemRequest.Request()
                     rqt.robot_id = self.robot_id
-                    response = self.call_service(self.pick_up_service, rqt)
-                    if response and response.success:
-                        self.get_logger().info('Item picked up.')
-                        # After pickup, set target zone and switch to navigation
-                        target_zone = ITEM_TO_ZONE.get(item.colour.upper())
-                        if target_zone:
-                            self.current_zone_target = target_zone
-                            self.state = State.SET_GOAL
-                            self.get_logger().info(f'Setting goal to {target_zone} for {item.colour} item')
+                    try:
+                        future = self.pick_up_service.call_async(rqt)
+                        self.executor.spin_until_future_complete(future)
+                        response = future.result()
+                        if response.success:
+                            self.get_logger().info('Item picked up.')
+                            # After pickup, set target zone and switch to navigation
+                            target_zone = ITEM_TO_ZONE.get(item.colour.upper())  # Convert to uppercase to match the mapping
+                            if target_zone:
+                                self.current_zone_target = target_zone
+                                self.state = State.SET_GOAL
+                                self.get_logger().info(f'Setting goal to {target_zone} for {item.colour} item')
+                                return  # Important: return here to prevent further movement
+                            else:
+                                self.get_logger().info(f'No zone mapping for item color: {item.colour}')
+                                self.state = State.FORWARD
+                            self.items.data = []  # Clear the items list after pickup
                             return
                         else:
-                            self.get_logger().info(f'No zone mapping for item color: {item.colour}')
-                            self.state = State.FORWARD
-                        self.items.data = []  # Clear the items list after pickup
-                        return
-                    elif response:
-                        self.get_logger().info('Unable to pick up item: ' + response.message)
+                            self.get_logger().info('Unable to pick up item: ' + response.message)
+                    except Exception as e:
+                        self.get_logger().info('Exception during pickup: ' + str(e))   
 
                 msg = Twist()
                 msg.linear.x = 0.25 * estimated_distance
@@ -437,11 +422,16 @@ class RobotController(Node):
                         # Try to offload the item
                         rqt = ItemRequest.Request()
                         rqt.robot_id = self.robot_id
-                        response = self.call_service(self.offload_service, rqt)
-                        if response and response.success:
-                            self.get_logger().info('Item offloaded successfully')
-                        elif response:
-                            self.get_logger().info('Failed to offload item: ' + response.message)
+                        try:
+                            future = self.offload_service.call_async(rqt)
+                            self.executor.spin_until_future_complete(future)
+                            response = future.result()
+                            if response.success:
+                                self.get_logger().info('Item offloaded successfully')
+                            else:
+                                self.get_logger().info('Failed to offload item: ' + response.message)
+                        except Exception as e:
+                            self.get_logger().info('Exception during offload: ' + str(e))
                     elif result == TaskResult.CANCELED:
                         self.get_logger().info('Navigation canceled!')
                     elif result == TaskResult.FAILED:
@@ -466,17 +456,19 @@ def main(args=None):
 
     rclpy.init(args = args, signal_handler_options = SignalHandlerOptions.NO)
 
+    node = RobotController()
+
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+
     try:
-        node = RobotController()
-        executor = MultiThreadedExecutor()
-        executor.add_node(node)
-        
-        try:
-            executor.spin()
-        finally:
-            executor.shutdown()
-            node.destroy_node()
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    except ExternalShutdownException:
+        sys.exit(1)
     finally:
+        node.destroy_node()
         rclpy.try_shutdown()
 
 
