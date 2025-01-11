@@ -57,7 +57,15 @@ class State(Enum):
     FORWARD = 0
     TURNING = 1
     COLLECTING = 2
-    NAVIGATING_TO_ZONE = 3
+    SET_GOAL = 3
+    NAVIGATING_TO_ZONE = 4
+
+# Map item colors to zones with their map coordinates
+ZONE_POSITIONS = {
+    'ZONE_PINK': {'x': 2.0, 'y': 2.0},
+    'ZONE_GREEN': {'x': 2.0, 'y': -2.0},
+    'ZONE_PURPLE': {'x': -2.0, 'y': 2.0}
+}
 
 # Map item colors to zones
 ITEM_TO_ZONE = {
@@ -237,40 +245,6 @@ class RobotController(Node):
     def zone_callback(self, msg):
         self.zones = msg
 
-    def get_zone_pose(self, zone_type):
-        for zone in self.zones.data:
-            if zone.zone == getattr(Zone, zone_type):
-                # Convert zone coordinates to a pose
-                goal_pose = PoseStamped()
-                goal_pose.header.frame_id = 'map'
-                goal_pose.header.stamp = self.get_clock().now().to_msg()
-                
-                # Set fixed map coordinates for each zone
-                match zone_type:
-                    case 'ZONE_PINK':
-                        goal_pose.pose.position.x = 2.0
-                        goal_pose.pose.position.y = 2.0
-                    case 'ZONE_GREEN':
-                        goal_pose.pose.position.x = 2.0
-                        goal_pose.pose.position.y = -2.0
-                    case 'ZONE_PURPLE':
-                        goal_pose.pose.position.x = -2.0
-                        goal_pose.pose.position.y = 2.0
-                    case _:
-                        return None
-                
-                # Set orientation to face the center
-                dx = 0.0 - goal_pose.pose.position.x  # Vector to center x
-                dy = 0.0 - goal_pose.pose.position.y  # Vector to center y
-                angle = math.atan2(dy, dx)  # Calculate angle to face center
-                
-                # Convert angle to quaternion
-                goal_pose.pose.orientation.z = math.sin(angle / 2.0)
-                goal_pose.pose.orientation.w = math.cos(angle / 2.0)
-                
-                self.get_logger().info(f'Zone {zone_type} at x:{goal_pose.pose.position.x:.2f} y:{goal_pose.pose.position.y:.2f}')
-                return goal_pose
-        return None
 
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
@@ -380,8 +354,8 @@ class RobotController(Node):
                             target_zone = ITEM_TO_ZONE.get(item.colour.upper())  # Convert to uppercase to match the mapping
                             if target_zone:
                                 self.current_zone_target = target_zone
-                                self.state = State.NAVIGATING_TO_ZONE
-                                self.get_logger().info(f'Moving to {target_zone} with {item.colour} item')
+                                self.state = State.SET_GOAL
+                                self.get_logger().info(f'Setting goal to {target_zone} for {item.colour} item')
                                 return  # Important: return here to prevent further movement
                             else:
                                 self.get_logger().info(f'No zone mapping for item color: {item.colour}')
@@ -398,22 +372,42 @@ class RobotController(Node):
                 msg.angular.z = item.x / 320.0
                 self.cmd_vel_publisher.publish(msg)
 
-            case State.NAVIGATING_TO_ZONE:
+            case State.SET_GOAL:
                 if not self.current_zone_target:
                     self.state = State.FORWARD
                     return
 
-                zone_pose = self.get_zone_pose(self.current_zone_target)
-                if not zone_pose:
-                    self.get_logger().info(f'Cannot find target zone {self.current_zone_target}')
-                    return  # Keep trying to find the zone
+                # Get the zone position from our mapping
+                zone_pos = ZONE_POSITIONS.get(self.current_zone_target)
+                if not zone_pos:
+                    self.get_logger().info(f'No position mapping for zone: {self.current_zone_target}')
+                    self.state = State.FORWARD
+                    return
 
-                # Only send the goal pose if we haven't started navigation yet
-                if not self.navigator.isTaskActive():
-                    self.navigator.goToPose(zone_pose)
-                    self.get_logger().info(f'Started navigation to {self.current_zone_target}')
+                # Create the goal pose
+                goal_pose = PoseStamped()
+                goal_pose.header.frame_id = 'map'
+                goal_pose.header.stamp = self.get_clock().now().to_msg()
+                goal_pose.pose.position.x = zone_pos['x']
+                goal_pose.pose.position.y = zone_pos['y']
+                
+                # Calculate orientation to face center
+                dx = 0.0 - zone_pos['x']  # Vector to center x
+                dy = 0.0 - zone_pos['y']  # Vector to center y
+                angle = math.atan2(dy, dx)  # Calculate angle to face center
+                
+                # Convert angle to quaternion
+                goal_pose.pose.orientation.z = math.sin(angle / 2.0)
+                goal_pose.pose.orientation.w = math.cos(angle / 2.0)
 
-                # Check navigation status
+                # Send the goal to the navigator
+                self.navigator.goToPose(goal_pose)
+                self.get_logger().info(f'Goal set to zone at x:{zone_pos["x"]:.2f} y:{zone_pos["y"]:.2f}')
+                
+                # Move to navigation state
+                self.state = State.NAVIGATING_TO_ZONE
+
+            case State.NAVIGATING_TO_ZONE:
                 if not self.navigator.isTaskComplete():
                     feedback = self.navigator.getFeedback()
                     if feedback:
