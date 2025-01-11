@@ -78,7 +78,7 @@ def generate_launch_description():
     
     declare_experiment_duration_cmd = DeclareLaunchArgument(
         'experiment_duration',
-        default_value='300.0',
+        default_value='600.0',
         description='Experiment duration in seconds')
     
     declare_data_log_path_cmd = DeclareLaunchArgument(
