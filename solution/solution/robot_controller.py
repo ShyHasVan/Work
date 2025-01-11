@@ -245,15 +245,28 @@ class RobotController(Node):
                 goal_pose.header.frame_id = 'map'
                 goal_pose.header.stamp = self.get_clock().now().to_msg()
                 
-                # The zone coordinates are relative to the camera center
-                # We need to convert them to map coordinates
-                # x in camera is left/right, y is up/down
-                # We'll use the robot's current pose as reference
-                goal_pose.pose.position.x = self.pose.position.x + (zone.y / 100.0)  # Forward/back
-                goal_pose.pose.position.y = self.pose.position.y - (zone.x / 100.0)  # Left/right
+                # Set fixed map coordinates for each zone
+                match zone_type:
+                    case 'ZONE_PINK':
+                        goal_pose.pose.position.x = 2.0
+                        goal_pose.pose.position.y = 2.0
+                    case 'ZONE_GREEN':
+                        goal_pose.pose.position.x = 2.0
+                        goal_pose.pose.position.y = -2.0
+                    case 'ZONE_PURPLE':
+                        goal_pose.pose.position.x = -2.0
+                        goal_pose.pose.position.y = 2.0
+                    case _:
+                        return None
                 
-                # Keep the same orientation as the robot
-                goal_pose.pose.orientation = self.pose.orientation
+                # Set orientation to face the center
+                dx = 0.0 - goal_pose.pose.position.x  # Vector to center x
+                dy = 0.0 - goal_pose.pose.position.y  # Vector to center y
+                angle = math.atan2(dy, dx)  # Calculate angle to face center
+                
+                # Convert angle to quaternion
+                goal_pose.pose.orientation.z = math.sin(angle / 2.0)
+                goal_pose.pose.orientation.w = math.cos(angle / 2.0)
                 
                 self.get_logger().info(f'Zone {zone_type} at x:{goal_pose.pose.position.x:.2f} y:{goal_pose.pose.position.y:.2f}')
                 return goal_pose
