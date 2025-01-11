@@ -386,23 +386,67 @@ class RobotController(Node):
 
                 msg = Twist()
                 
-                # Check for obstacles while approaching item
+                # Safety first - if we're too close to any obstacle, back up
+                if (self.scan_triggered[SCAN_FRONT] and estimated_distance > 0.5) or \
+                   (self.scan_triggered[SCAN_LEFT] and self.scan_triggered[SCAN_RIGHT]):
+                    msg.linear.x = -0.2
+                    msg.angular.z = 0.0  # Pure backup, no turning
+                    self.get_logger().info('Too close to obstacles, backing up for safety')
+                    self.cmd_vel_publisher.publish(msg)
+                    return
+
+                # If we're far from the item and obstacles are present, prioritize avoidance
+                if estimated_distance > 1.0:
+                    if self.scan_triggered[SCAN_FRONT]:
+                        # Find the best direction to turn based on item position
+                        turn_direction = TURN_LEFT if item.x < 320 else TURN_RIGHT
+                        msg.angular.z = ANGULAR_VELOCITY * 1.5 * turn_direction
+                        msg.linear.x = 0.0  # Stop and turn in place
+                        self.get_logger().info(f'Far from item, avoiding obstacle by turning {turn_direction}')
+                        self.cmd_vel_publisher.publish(msg)
+                        return
+
+                # Normal collection behavior with enhanced obstacle avoidance
                 if self.scan_triggered[SCAN_FRONT]:
-                    # If obstacle directly in front, try to maneuver around it
-                    if not self.scan_triggered[SCAN_LEFT]:
-                        msg.angular.z = ANGULAR_VELOCITY  # Turn left if left is clear
-                        self.get_logger().info('Obstacle in front while collecting, turning left')
-                    elif not self.scan_triggered[SCAN_RIGHT]:
-                        msg.angular.z = -ANGULAR_VELOCITY  # Turn right if right is clear
-                        self.get_logger().info('Obstacle in front while collecting, turning right')
+                    # Determine best escape direction based on item position and side clearance
+                    if not self.scan_triggered[SCAN_LEFT] and (item.x < 320 or self.scan_triggered[SCAN_RIGHT]):
+                        msg.angular.z = ANGULAR_VELOCITY * 1.5  # Sharp left turn
+                        msg.linear.x = 0.0  # Stop forward motion for sharper turn
+                        self.get_logger().info('Obstacle in front, executing sharp left turn')
+                    elif not self.scan_triggered[SCAN_RIGHT] and (item.x >= 320 or self.scan_triggered[SCAN_LEFT]):
+                        msg.angular.z = -ANGULAR_VELOCITY * 1.5  # Sharp right turn
+                        msg.linear.x = 0.0  # Stop forward motion for sharper turn
+                        self.get_logger().info('Obstacle in front, executing sharp right turn')
                     else:
-                        # If both sides blocked, back up slightly and try again
-                        msg.linear.x = -0.1
-                        self.get_logger().info('Obstacles all around while collecting, backing up')
+                        # If no clear direction, back up and try again
+                        msg.linear.x = -0.2
+                        msg.angular.z = 0.0
+                        self.get_logger().info('No clear path, backing up to reassess')
+                elif self.scan_triggered[SCAN_LEFT]:
+                    # Stronger bias to the right when obstacle on left
+                    msg.linear.x = 0.15 * estimated_distance
+                    msg.angular.z = -0.3  # Fixed right bias
+                    if item.x < 160:  # If item is far left, slow down more
+                        msg.linear.x *= 0.5
+                    self.get_logger().info('Obstacle on left, strong right bias')
+                elif self.scan_triggered[SCAN_RIGHT]:
+                    # Stronger bias to the left when obstacle on right
+                    msg.linear.x = 0.15 * estimated_distance
+                    msg.angular.z = 0.3  # Fixed left bias
+                    if item.x > 480:  # If item is far right, slow down more
+                        msg.linear.x *= 0.5
+                    self.get_logger().info('Obstacle on right, strong left bias')
                 else:
-                    # No obstacles, proceed towards item
-                    msg.linear.x = 0.25 * estimated_distance
-                    msg.angular.z = item.x / 320.0  # Original item tracking behavior
+                    # Clear path to item - normal approach
+                    # Reduce speed when item is not centered for better control
+                    centering_factor = 1.0 - min(abs(item.x - 320) / 320.0, 0.7)
+                    msg.linear.x = 0.2 * estimated_distance * centering_factor
+                    msg.angular.z = item.x / 320.0  # Standard item tracking
+                    self.get_logger().info(f'Clear path to item, centering factor: {centering_factor:.2f}')
+                
+                # Final safety check - ensure we're not moving too fast
+                msg.linear.x = max(min(msg.linear.x, 0.3), -0.2)  # Clamp linear velocity
+                msg.angular.z = max(min(msg.angular.z, ANGULAR_VELOCITY * 1.5), -ANGULAR_VELOCITY * 1.5)  # Clamp angular velocity
                 
                 self.cmd_vel_publisher.publish(msg)
 
