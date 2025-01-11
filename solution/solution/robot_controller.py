@@ -93,6 +93,7 @@ class RobotController(Node):
         self.items = ItemList()
         self.zones = ZoneList()
         self.current_zone_target = None
+        self.executor = MultiThreadedExecutor()  # Store executor as instance variable
 
         # Get robot_id parameter first
         self.declare_parameter('robot_id', 'robot1')
@@ -131,8 +132,8 @@ class RobotController(Node):
         client_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
 
-        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
-        self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
+        self.pick_up_service = self.create_client(ItemRequest, f'/{self.robot_id}/pick_up_item', callback_group=client_callback_group)
+        self.offload_service = self.create_client(ItemRequest, f'/{self.robot_id}/offload_item', callback_group=client_callback_group)
 
         self.item_subscriber = self.create_subscription(
             ItemList,
@@ -365,7 +366,7 @@ class RobotController(Node):
                     rqt.robot_id = self.robot_id
                     try:
                         future = self.pick_up_service.call_async(rqt)
-                        self.executor.spin_until_future_complete(future)
+                        rclpy.spin_until_future_complete(future, self.executor)  # Use instance executor
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Item picked up.')
@@ -441,7 +442,7 @@ class RobotController(Node):
                         rqt.robot_id = self.robot_id
                         try:
                             future = self.offload_service.call_async(rqt)
-                            self.executor.spin_until_future_complete(future)
+                            rclpy.spin_until_future_complete(future, self.executor)  # Use instance executor
                             response = future.result()
                             if response.success:
                                 self.get_logger().info('Item offloaded successfully')
@@ -474,12 +475,10 @@ def main(args=None):
     rclpy.init(args = args, signal_handler_options = SignalHandlerOptions.NO)
 
     node = RobotController()
-
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
+    node.executor.add_node(node)  # Use the instance executor
 
     try:
-        executor.spin()
+        node.executor.spin()  # Use the instance executor
     except KeyboardInterrupt:
         pass
     except ExternalShutdownException:
