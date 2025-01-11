@@ -69,9 +69,9 @@ ZONE_POSITIONS = {
 
 # Map item colors to zones
 ITEM_TO_ZONE = {
-    'RED': 'ZONE_PINK',     # Red items go to pink zone
+    'RED': 'ZONE_CYAN',     # Red items go to cyan zone
     'GREEN': 'ZONE_GREEN',  # Green items go to green zone
-    'BLUE': 'ZONE_PURPLE'   # Blue items go to purple zone
+    'BLUE': 'ZONE_PINK'   # Blue items go to pink zone
 }
 
 class RobotController(Node):
@@ -318,7 +318,6 @@ class RobotController(Node):
                 msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
 
-                # self.get_logger().info(f"Turned {math.degrees(math.fabs(yaw_difference)):.2f} out of {self.turn_angle:.2f} degrees")
 
                 yaw_difference = angles.normalize_angle(self.yaw - self.previous_yaw)                
 
@@ -332,6 +331,35 @@ class RobotController(Node):
                 if len(self.items.data) == 0:
                     self.previous_pose = self.pose
                     self.state = State.FORWARD
+                    return
+                
+                # Check for obstacles first
+                if self.scan_triggered[SCAN_FRONT]:
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = random.uniform(150, 170)
+                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    self.get_logger().info("Detected obstacle in front while collecting, turning " + 
+                                         ("left" if self.turn_direction == TURN_LEFT else "right") + 
+                                         f" by {self.turn_angle:.2f} degrees")
+                    return
+                
+                if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = 45
+
+                    if self.scan_triggered[SCAN_LEFT] and self.scan_triggered[SCAN_RIGHT]:
+                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                        self.get_logger().info("Detected obstacle to both sides while collecting, turning " + 
+                                             ("left" if self.turn_direction == TURN_LEFT else "right") + 
+                                             f" by {self.turn_angle:.2f} degrees")
+                    elif self.scan_triggered[SCAN_LEFT]:
+                        self.turn_direction = TURN_RIGHT
+                        self.get_logger().info(f"Detected obstacle to the left while collecting, turning right by {self.turn_angle} degrees")
+                    else:  # self.scan_triggered[SCAN_RIGHT]
+                        self.turn_direction = TURN_LEFT
+                        self.get_logger().info(f"Detected obstacle to the right while collecting, turning left by {self.turn_angle} degrees")
                     return
                 
                 item = self.items.data[0]
@@ -367,6 +395,7 @@ class RobotController(Node):
                     except Exception as e:
                         self.get_logger().info('Exception during pickup: ' + str(e))   
 
+                # If no obstacles, move towards the item
                 msg = Twist()
                 msg.linear.x = 0.25 * estimated_distance
                 msg.angular.z = item.x / 320.0
