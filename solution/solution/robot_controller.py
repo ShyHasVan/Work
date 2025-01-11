@@ -1,4 +1,3 @@
-
 #
 # Copyright (c) 2024 University of York and others
 #
