@@ -365,7 +365,8 @@ class RobotController(Node):
                     rqt.robot_id = self.robot_id
                     try:
                         future = self.pick_up_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(future, self.executor)  # Use instance executor
+                        while not future.done():
+                            rclpy.spin_once(self)
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Item picked up.')
@@ -441,7 +442,8 @@ class RobotController(Node):
                         rqt.robot_id = self.robot_id
                         try:
                             future = self.offload_service.call_async(rqt)
-                            rclpy.spin_until_future_complete(future, self.executor)  # Use instance executor
+                            while not future.done():
+                                rclpy.spin_once(self)
                             response = future.result()
                             if response.success:
                                 self.get_logger().info('Item offloaded successfully')
