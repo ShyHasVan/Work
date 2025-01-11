@@ -68,7 +68,7 @@ def generate_launch_description():
 
     declare_num_robots_cmd = DeclareLaunchArgument(
         'num_robots',
-        default_value='1',
+        default_value='3',
         description='Number of robots to spawn')
     
     declare_random_seed_cmd = DeclareLaunchArgument(

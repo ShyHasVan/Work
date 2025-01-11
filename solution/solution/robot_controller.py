@@ -1,4 +1,3 @@
-
 #
 # Copyright (c) 2024 University of York and others
 #
@@ -27,7 +26,7 @@ from std_msgs.msg import Float32
 from geometry_msgs.msg import Twist, Pose, PoseStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from assessment_interfaces.msg import Item, ItemList, Zone, ZoneList
+from assessment_interfaces.msg import Item, ItemList, Zone, ZoneList, ItemLog
 from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
 
@@ -63,17 +62,18 @@ class State(Enum):
 
 # Map item colors to zones with their map coordinates
 ZONE_POSITIONS = {
-    'ZONE_PINK': {'x': 2.5, 'y': 2.5},    # Pink zone in top left
-    'ZONE_GREEN': {'x': 2.5, 'y': -2.5},   # Green zone in top right
-    'ZONE_PURPLE': {'x': -2.5, 'y': -2.5}, # Purple zone in bottom right
-    'ZONE_CYAN': {'x': -3.5, 'y': 2.5}     # Cyan zone in bottom left
+    'ZONE_PINK': {'x': 2.5, 'y': 2.5},    # Pink zone in top right
+    'ZONE_GREEN': {'x': 2.5, 'y': -2.5},   # Green zone in bottom right
+    'ZONE_PURPLE': {'x': -2.5, 'y': -2.5}, # Purple zone in bottom left
+    'ZONE_CYAN': {'x': -2.5, 'y': 2.5}     # Cyan zone in top left
 }
 
-# Map item colors to zones
+# Map item colors to zones - initially all zones can accept any color
+# This will be updated dynamically as zones get assigned to colors
 ITEM_TO_ZONE = {
-    'RED': 'ZONE_CYAN',     # Red items go to cyan zone
-    'GREEN': 'ZONE_GREEN',  # Green items go to green zone
-    'BLUE': 'ZONE_PINK'     # Blue items go to pink zone
+    'RED': None,     # Will be dynamically assigned
+    'GREEN': None,   # Will be dynamically assigned
+    'BLUE': None     # Will be dynamically assigned
 }
 
 class RobotController(Node):
@@ -98,21 +98,32 @@ class RobotController(Node):
         # Initialize navigation
         self.navigator = BasicNavigator()
         
-        # Set initial pose for navigation
+        # Get robot ID parameter
+        self.declare_parameter('robot_id', 'robot1')
+        self.robot_id = self.get_parameter('robot_id').value
+        
+        # Set initial pose based on robot ID from config
         initial_pose = PoseStamped()
         initial_pose.header.frame_id = 'map'
         initial_pose.header.stamp = self.get_clock().now().to_msg()
-        initial_pose.pose.position.x = -3.5
-        initial_pose.pose.position.y = 0.0
+        
+        # Set position based on robot ID
+        if self.robot_id == 'robot1':
+            initial_pose.pose.position.x = -3.5
+            initial_pose.pose.position.y = 2.0
+        elif self.robot_id == 'robot2':
+            initial_pose.pose.position.x = -3.5
+            initial_pose.pose.position.y = 0.0
+        elif self.robot_id == 'robot3':
+            initial_pose.pose.position.x = -3.5
+            initial_pose.pose.position.y = -2.0
+        
         initial_pose.pose.orientation.z = 0.0
         initial_pose.pose.orientation.w = 1.0
         self.navigator.setInitialPose(initial_pose)
 
         # Wait for navigation to be ready
         self.navigator.waitUntilNav2Active()
-
-        self.declare_parameter('robot_id', 'robot1')
-        self.robot_id = self.get_parameter('robot_id').value
 
         # Here we use two callback groups, to ensure that those in 'client_callback_group' can be executed
         # independently from those in 'timer_callback_group'. This allos calling the services below within
@@ -189,6 +200,21 @@ class RobotController(Node):
         self.timer_period = 0.1 # 100 milliseconds = 10 Hz
         self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
 
+        # Add zone color tracking
+        self.zone_color_assignments = {
+            'ZONE_PINK': None,
+            'ZONE_GREEN': None,
+            'ZONE_PURPLE': None,
+            'ZONE_CYAN': None
+        }
+        
+        # Subscribe to item_log to track zone assignments
+        self.item_log_subscriber = self.create_subscription(
+            ItemLog,
+            '/item_log',
+            self.item_log_callback,
+            10)
+
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
             # Only log when we first see an item
@@ -247,6 +273,28 @@ class RobotController(Node):
     def zone_callback(self, msg):
         self.zones = msg
 
+    def item_log_callback(self, msg):
+        """Update zone assignments based on successful deposits"""
+        for item in msg.data:
+            if item.zone_name and item.colour:
+                # Update zone color assignment
+                self.zone_color_assignments[item.zone_name] = item.colour
+                # Update ITEM_TO_ZONE mapping
+                ITEM_TO_ZONE[item.colour] = item.zone_name
+                self.get_logger().info(f'Zone {item.zone_name} is now assigned to {item.colour} items')
+
+    def find_available_zone(self, item_color):
+        """Find an available zone for the given item color"""
+        # First check if this color already has an assigned zone
+        if ITEM_TO_ZONE[item_color]:
+            return ITEM_TO_ZONE[item_color]
+        
+        # If not, look for an unassigned zone
+        for zone_name, assigned_color in self.zone_color_assignments.items():
+            if assigned_color is None:
+                return zone_name
+        
+        return None
 
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
@@ -338,6 +386,14 @@ class RobotController(Node):
                 
                 item = self.items.data[0]
 
+                # Check if we can find a suitable zone for this item
+                target_zone = self.find_available_zone(item.colour.upper())
+                if not target_zone:
+                    self.get_logger().info(f'No available zone found for {item.colour} item')
+                    # Skip this item and continue exploring
+                    self.state = State.FORWARD
+                    return
+
                 # Obtained by curve fitting from experimental runs.
                 estimated_distance = 32.4 * float(item.diameter) ** -0.75
 
@@ -352,17 +408,9 @@ class RobotController(Node):
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Item picked up.')
-                            # After pickup, set target zone and switch to navigation
-                            target_zone = ITEM_TO_ZONE.get(item.colour.upper())  # Convert to uppercase to match the mapping
-                            if target_zone:
-                                self.current_zone_target = target_zone
-                                self.state = State.SET_GOAL
-                                self.get_logger().info(f'Setting goal to {target_zone} for {item.colour} item')
-                                return  # Important: return here to prevent further movement
-                            else:
-                                self.get_logger().info(f'No zone mapping for item color: {item.colour}')
-                                self.state = State.FORWARD
-                            self.items.data = []  # Clear the items list after pickup
+                            self.current_zone_target = target_zone
+                            self.state = State.SET_GOAL
+                            self.get_logger().info(f'Setting goal to {target_zone} for {item.colour} item')
                             return
                         else:
                             self.get_logger().info('Unable to pick up item: ' + response.message)
