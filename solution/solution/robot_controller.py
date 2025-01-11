@@ -379,9 +379,6 @@ class RobotController(Node):
                 self.cmd_vel_publisher.publish(msg)
 
             case State.NAVIGATING_TO_ZONE:
-                if not self.current_zone_target:
-                    self.state = State.FORWARD
-                    return
 
                 zone_pose = self.get_zone_pose(self.current_zone_target)
                 if not zone_pose:
