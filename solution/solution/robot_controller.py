@@ -62,16 +62,17 @@ class State(Enum):
 
 # Map item colors to zones with their map coordinates
 ZONE_POSITIONS = {
-    'ZONE_PINK': {'x': 2.5, 'y': 2.5},    # Move slightly further to ensure we're inside
-    'ZONE_GREEN': {'x': 2.5, 'y': -2.5},   # Move slightly further to ensure we're inside
-    'ZONE_PURPLE': {'x': -2.5, 'y': 2.5}   # Move slightly further to ensure we're inside
+    'ZONE_PINK': {'x': 2.5, 'y': 2.5},    # Pink zone in top right
+    'ZONE_GREEN': {'x': 2.5, 'y': -2.5},   # Green zone in bottom right
+    'ZONE_PURPLE': {'x': -2.5, 'y': 2.5},   # Purple zone in top left
+    'ZONE_CYAN': {'x': -2.5, 'y': -2.5}    # Cyan zone in bottom left
 }
 
 # Map item colors to zones
 ITEM_TO_ZONE = {
-    'RED': 'ZONE_CYAN',     # Red items go to cyan zone
-    'GREEN': 'ZONE_GREEN',  # Green items go to green zone
-    'BLUE': 'ZONE_PINK'   # Blue items go to pink zone
+    'RED': 'ZONE_CYAN',     # Red items go to cyan zone (bottom left)
+    'GREEN': 'ZONE_GREEN',  # Green items go to green zone (bottom right)
+    'BLUE': 'ZONE_PINK'   # Blue items go to pink zone (top right)
 }
 
 class RobotController(Node):
