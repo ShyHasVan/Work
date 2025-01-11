@@ -61,7 +61,7 @@ class State(Enum):
 
 # Map item colors to zones
 ITEM_TO_ZONE = {
-    'RED': 'ZONE_CYAN',     # Red items go to cyan zone
+    'RED': 'ZONE_PINK',     # Red items go to pink zone
     'GREEN': 'ZONE_GREEN',  # Green items go to green zone
     'BLUE': 'ZONE_PURPLE'   # Blue items go to purple zone
 }
@@ -244,11 +244,18 @@ class RobotController(Node):
                 goal_pose = PoseStamped()
                 goal_pose.header.frame_id = 'map'
                 goal_pose.header.stamp = self.get_clock().now().to_msg()
-                # Convert from camera coordinates to map coordinates
-                # Note: This is a simplified conversion, might need adjustment
-                goal_pose.pose.position.x = zone.x / 100.0  # Convert to meters
-                goal_pose.pose.position.y = zone.y / 100.0  # Convert to meters
-                goal_pose.pose.orientation.w = 1.0
+                
+                # The zone coordinates are relative to the camera center
+                # We need to convert them to map coordinates
+                # x in camera is left/right, y is up/down
+                # We'll use the robot's current pose as reference
+                goal_pose.pose.position.x = self.pose.position.x + (zone.y / 100.0)  # Forward/back
+                goal_pose.pose.position.y = self.pose.position.y - (zone.x / 100.0)  # Left/right
+                
+                # Keep the same orientation as the robot
+                goal_pose.pose.orientation = self.pose.orientation
+                
+                self.get_logger().info(f'Zone {zone_type} at x:{goal_pose.pose.position.x:.2f} y:{goal_pose.pose.position.y:.2f}')
                 return goal_pose
         return None
 
@@ -361,9 +368,6 @@ class RobotController(Node):
                             if target_zone:
                                 self.current_zone_target = target_zone
                                 self.state = State.NAVIGATING_TO_ZONE
-                            else:
-                                self.state = State.FORWARD
-                            self.items.data = []
                         else:
                             self.get_logger().info('Unable to pick up item: ' + response.message)
                     except Exception as e:
@@ -385,6 +389,11 @@ class RobotController(Node):
                     self.state = State.FORWARD
                     return
 
+                # Send the goal pose to Nav2
+                self.navigator.goToPose(zone_pose)
+                self.get_logger().info(f'Navigating to {self.current_zone_target}')
+
+                # Check if we're still navigating
                 if not self.navigator.isTaskComplete():
                     feedback = self.navigator.getFeedback()
                     if feedback:
@@ -407,6 +416,13 @@ class RobotController(Node):
                                 self.get_logger().info('Failed to offload item: ' + response.message)
                         except Exception as e:
                             self.get_logger().info('Exception during offload: ' + str(e))
+                    elif result == TaskResult.CANCELED:
+                        self.get_logger().info('Navigation canceled!')
+                    elif result == TaskResult.FAILED:
+                        self.get_logger().info('Navigation failed!')
+                    else:
+                        self.get_logger().info('Navigation has an invalid return status!')
+                    
                     self.current_zone_target = None
                     self.state = State.FORWARD
 
