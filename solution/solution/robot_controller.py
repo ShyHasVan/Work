@@ -356,14 +356,25 @@ class RobotController(Node):
                     self.current_item_id = None
                     return
                 
-                # Get the closest non-blocked item
-                available_items = [item for item in self.items.data if id(item) not in self.blocked_items]
+                # Filter items by robot-specific color and blocked status
+                target_color = None
+                if self.robot_id == 'robot1':
+                    target_color = 'BLUE'
+                elif self.robot_id == 'robot2':
+                    target_color = 'RED'
+                elif self.robot_id == 'robot3':
+                    target_color = 'GREEN'
+                
+                available_items = [item for item in self.items.data 
+                                 if id(item) not in self.blocked_items and 
+                                 item.colour.upper() == target_color]
+                
                 if not available_items:
-                    self.blocked_items.clear()
+                    # Don't clear blocked items - just return to FORWARD if no matching items
                     self.state = State.FORWARD
                     self.obstacle_counter = 0
                     self.current_item_id = None
-                    self.get_logger().info('All visible items are blocked, returning to FORWARD state')
+                    self.get_logger().info(f'No available {target_color} items for {self.robot_id}, returning to FORWARD state')
                     return
                 
                 item = available_items[0]
