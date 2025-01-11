@@ -93,6 +93,9 @@ class RobotController(Node):
         self.items = ItemList()
         self.zones = ZoneList()
         self.current_zone_target = None
+        self.obstacle_counter = 0  # Counter for persistent obstacles
+        self.current_item_id = None  # Track the current item being pursued
+        self.blocked_items = set()  # Set to store IDs of items that were blocked by obstacles
 
         self.robot_id = self.get_namespace().strip("/")
         
@@ -349,15 +352,33 @@ class RobotController(Node):
                 if len(self.items.data) == 0:
                     self.previous_pose = self.pose
                     self.state = State.FORWARD
+                    self.obstacle_counter = 0
+                    self.current_item_id = None
                     return
                 
-                item = self.items.data[0]
+                # Get the closest non-blocked item
+                available_items = [item for item in self.items.data if id(item) not in self.blocked_items]
+                if not available_items:
+                    self.blocked_items.clear()
+                    self.state = State.FORWARD
+                    self.obstacle_counter = 0
+                    self.current_item_id = None
+                    self.get_logger().info('All visible items are blocked, returning to FORWARD state')
+                    return
+                
+                item = available_items[0]
+                
+                # Reset counter for new items
+                if self.current_item_id != id(item):
+                    self.current_item_id = id(item)
+                    self.obstacle_counter = 0
+                    self.get_logger().info('Pursuing new item')
 
-                # Obtained by curve fitting from experimental runs.
+                # Calculate distance to item
                 estimated_distance = 32.4 * float(item.diameter) ** -0.75
-
                 self.get_logger().info(f'Estimated distance {estimated_distance}')
 
+                # Try pickup if close enough
                 if estimated_distance <= 0.35:
                     rqt = ItemRequest.Request()
                     rqt.robot_id = self.robot_id
@@ -367,17 +388,17 @@ class RobotController(Node):
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Item picked up.')
-                            # After pickup, set target zone and switch to navigation
-                            target_zone = ITEM_TO_ZONE.get(item.colour.upper())  # Convert to uppercase to match the mapping
+                            self.obstacle_counter = 0
+                            self.current_item_id = None
+                            target_zone = ITEM_TO_ZONE.get(item.colour.upper())
                             if target_zone:
                                 self.current_zone_target = target_zone
                                 self.state = State.SET_GOAL
                                 self.get_logger().info(f'Setting goal to {target_zone} for {item.colour} item')
-                                return  # Important: return here to prevent further movement
                             else:
                                 self.get_logger().info(f'No zone mapping for item color: {item.colour}')
                                 self.state = State.FORWARD
-                            self.items.data = []  # Clear the items list after pickup
+                            self.items.data = []
                             return
                         else:
                             self.get_logger().info('Unable to pick up item: ' + response.message)
@@ -385,68 +406,44 @@ class RobotController(Node):
                         self.get_logger().info('Exception during pickup: ' + str(e))   
 
                 msg = Twist()
-                
-                # Safety first - if we're too close to any obstacle, back up
-                if (self.scan_triggered[SCAN_FRONT] and estimated_distance > 0.5) or \
-                   (self.scan_triggered[SCAN_LEFT] and self.scan_triggered[SCAN_RIGHT]):
-                    msg.linear.x = -0.2
-                    msg.angular.z = 0.0  # Pure backup, no turning
-                    self.get_logger().info('Too close to obstacles, backing up for safety')
-                    self.cmd_vel_publisher.publish(msg)
-                    return
 
-                # If we're far from the item and obstacles are present, prioritize avoidance
-                if estimated_distance > 1.0:
-                    if self.scan_triggered[SCAN_FRONT]:
-                        # Find the best direction to turn based on item position
-                        turn_direction = TURN_LEFT if item.x < 320 else TURN_RIGHT
-                        msg.angular.z = ANGULAR_VELOCITY * 1.5 * turn_direction
-                        msg.linear.x = 0.0  # Stop and turn in place
-                        self.get_logger().info(f'Far from item, avoiding obstacle by turning {turn_direction}')
-                        self.cmd_vel_publisher.publish(msg)
+                # Check for persistent obstacles
+                if self.scan_triggered[SCAN_FRONT] or \
+                   (self.scan_triggered[SCAN_LEFT] and self.scan_triggered[SCAN_RIGHT]):
+                    self.obstacle_counter += 1
+                    if self.obstacle_counter > 30:  # 3 seconds at 10Hz
+                        self.get_logger().info(f'Abandoning item due to persistent obstacles')
+                        self.blocked_items.add(self.current_item_id)
+                        self.obstacle_counter = 0
+                        self.current_item_id = None
+                        self.state = State.FORWARD
                         return
 
-                # Normal collection behavior with enhanced obstacle avoidance
+                # Obstacle avoidance and movement control
                 if self.scan_triggered[SCAN_FRONT]:
-                    # Determine best escape direction based on item position and side clearance
-                    if not self.scan_triggered[SCAN_LEFT] and (item.x < 320 or self.scan_triggered[SCAN_RIGHT]):
-                        msg.angular.z = ANGULAR_VELOCITY * 1.5  # Sharp left turn
-                        msg.linear.x = 0.0  # Stop forward motion for sharper turn
-                        self.get_logger().info('Obstacle in front, executing sharp left turn')
-                    elif not self.scan_triggered[SCAN_RIGHT] and (item.x >= 320 or self.scan_triggered[SCAN_LEFT]):
-                        msg.angular.z = -ANGULAR_VELOCITY * 1.5  # Sharp right turn
-                        msg.linear.x = 0.0  # Stop forward motion for sharper turn
-                        self.get_logger().info('Obstacle in front, executing sharp right turn')
-                    else:
-                        # If no clear direction, back up and try again
-                        msg.linear.x = -0.2
-                        msg.angular.z = 0.0
-                        self.get_logger().info('No clear path, backing up to reassess')
+                    # Stop and turn away from obstacle
+                    msg.linear.x = 0.0
+                    msg.angular.z = ANGULAR_VELOCITY * 1.5 * (TURN_LEFT if item.x < 320 else TURN_RIGHT)
+                    self.get_logger().info('Front obstacle detected, turning to avoid')
                 elif self.scan_triggered[SCAN_LEFT]:
-                    # Stronger bias to the right when obstacle on left
+                    # Bias right
                     msg.linear.x = 0.15 * estimated_distance
-                    msg.angular.z = -0.3  # Fixed right bias
-                    if item.x < 160:  # If item is far left, slow down more
-                        msg.linear.x *= 0.5
-                    self.get_logger().info('Obstacle on left, strong right bias')
+                    msg.angular.z = -0.3
+                    self.get_logger().info('Left obstacle detected, biasing right')
                 elif self.scan_triggered[SCAN_RIGHT]:
-                    # Stronger bias to the left when obstacle on right
+                    # Bias left
                     msg.linear.x = 0.15 * estimated_distance
-                    msg.angular.z = 0.3  # Fixed left bias
-                    if item.x > 480:  # If item is far right, slow down more
-                        msg.linear.x *= 0.5
-                    self.get_logger().info('Obstacle on right, strong left bias')
+                    msg.angular.z = 0.3
+                    self.get_logger().info('Right obstacle detected, biasing left')
                 else:
-                    # Clear path to item - normal approach
-                    # Reduce speed when item is not centered for better control
+                    # Normal approach with centering
                     centering_factor = 1.0 - min(abs(item.x - 320) / 320.0, 0.7)
                     msg.linear.x = 0.2 * estimated_distance * centering_factor
-                    msg.angular.z = item.x / 320.0  # Standard item tracking
-                    self.get_logger().info(f'Clear path to item, centering factor: {centering_factor:.2f}')
+                    msg.angular.z = item.x / 320.0
                 
-                # Final safety check - ensure we're not moving too fast
-                msg.linear.x = max(min(msg.linear.x, 0.3), -0.2)  # Clamp linear velocity
-                msg.angular.z = max(min(msg.angular.z, ANGULAR_VELOCITY * 1.5), -ANGULAR_VELOCITY * 1.5)  # Clamp angular velocity
+                # Safety velocity limits
+                msg.linear.x = max(min(msg.linear.x, 0.3), -0.2)
+                msg.angular.z = max(min(msg.angular.z, ANGULAR_VELOCITY * 1.5), -ANGULAR_VELOCITY * 1.5)
                 
                 self.cmd_vel_publisher.publish(msg)
 
