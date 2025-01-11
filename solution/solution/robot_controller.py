@@ -45,7 +45,7 @@ ANGULAR_VELOCITY = 0.5 # Radians per second
 TURN_LEFT = 1 # Postive angular velocity turns left
 TURN_RIGHT = -1 # Negative angular velocity turns right
 
-SCAN_THRESHOLD = 0.2 # Metres - reduced from 0.5 to allow closer approach to obstacles
+SCAN_THRESHOLD = 0.5 # Metres per second
  # Array indexes for sensor sectors
 SCAN_FRONT = 0
 SCAN_LEFT = 1
@@ -62,17 +62,17 @@ class State(Enum):
 
 # Map item colors to zones with their map coordinates
 ZONE_POSITIONS = {
-    'ZONE_PINK': {'x': 2.5, 'y': 2.5},    # Pink zone in top right
-    'ZONE_GREEN': {'x': 2.5, 'y': -2.5},   # Green zone in bottom right
-    'ZONE_PURPLE': {'x': -2.5, 'y': 2.5},   # Purple zone in top left
-    'ZONE_CYAN': {'x': -2.5, 'y': -2.5}    # Cyan zone in bottom left
+    'ZONE_PINK': {'x': 2.5, 'y': 2.5},    # Pink zone in top left
+    'ZONE_GREEN': {'x': 2.5, 'y': -2.5},   # Green zone in top right
+    'ZONE_PURPLE': {'x': -2.5, 'y': -2.5}, # Purple zone in bottom right
+    'ZONE_CYAN': {'x': -2.5, 'y': 2.5}     # Cyan zone in bottom left
 }
 
 # Map item colors to zones
 ITEM_TO_ZONE = {
-    'RED': 'ZONE_CYAN',     # Red items go to cyan zone (bottom left)
-    'GREEN': 'ZONE_GREEN',  # Green items go to green zone (bottom right)
-    'BLUE': 'ZONE_PINK'   # Blue items go to pink zone (top right)
+    'RED': 'ZONE_CYAN',     # Red items go to cyan zone
+    'GREEN': 'ZONE_GREEN',  # Green items go to green zone
+    'BLUE': 'ZONE_PINK'     # Blue items go to pink zone
 }
 
 class RobotController(Node):
@@ -319,6 +319,7 @@ class RobotController(Node):
                 msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
 
+                # self.get_logger().info(f"Turned {math.degrees(math.fabs(yaw_difference)):.2f} out of {self.turn_angle:.2f} degrees")
 
                 yaw_difference = angles.normalize_angle(self.yaw - self.previous_yaw)                
 
@@ -335,63 +336,41 @@ class RobotController(Node):
                     return
                 
                 item = self.items.data[0]
+
+                # Obtained by curve fitting from experimental runs.
                 estimated_distance = 32.4 * float(item.diameter) ** -0.75
+
                 self.get_logger().info(f'Estimated distance {estimated_distance}')
 
-                # Check for obstacles and adjust movement accordingly
-                msg = Twist()
-                should_avoid = False
-
-                if self.scan_triggered[SCAN_FRONT]:
-                    # If obstacle is very close in front, turn in place
-                    self.get_logger().info("Avoiding obstacle in front while collecting")
-                    msg.angular.z = ANGULAR_VELOCITY
-                    should_avoid = True
-                
-                if self.scan_triggered[SCAN_LEFT]:
-                    # If obstacle on left, bias towards turning right
-                    self.get_logger().info("Avoiding obstacle on left while collecting")
-                    msg.angular.z = -0.3
-                    should_avoid = True
-                
-                if self.scan_triggered[SCAN_RIGHT]:
-                    # If obstacle on right, bias towards turning left
-                    self.get_logger().info("Avoiding obstacle on right while collecting")
-                    msg.angular.z = 0.3
-                    should_avoid = True
-
-                if not should_avoid:
-                    # No obstacles, proceed with normal item collection
-                    if estimated_distance <= 0.35:
-                        rqt = ItemRequest.Request()
-                        rqt.robot_id = self.robot_id
-                        try:
-                            future = self.pick_up_service.call_async(rqt)
-                            self.executor.spin_until_future_complete(future)
-                            response = future.result()
-                            if response.success:
-                                self.get_logger().info('Item picked up.')
-                                # After pickup, set target zone and switch to navigation
-                                target_zone = ITEM_TO_ZONE.get(item.colour.upper())
-                                if target_zone:
-                                    self.current_zone_target = target_zone
-                                    self.state = State.SET_GOAL
-                                    self.get_logger().info(f'Setting goal to {target_zone} for {item.colour} item')
-                                    return
-                                else:
-                                    self.get_logger().info(f'No zone mapping for item color: {item.colour}')
-                                    self.state = State.FORWARD
-                                self.items.data = []
-                                return
+                if estimated_distance <= 0.35:
+                    rqt = ItemRequest.Request()
+                    rqt.robot_id = self.robot_id
+                    try:
+                        future = self.pick_up_service.call_async(rqt)
+                        self.executor.spin_until_future_complete(future)
+                        response = future.result()
+                        if response.success:
+                            self.get_logger().info('Item picked up.')
+                            # After pickup, set target zone and switch to navigation
+                            target_zone = ITEM_TO_ZONE.get(item.colour.upper())  # Convert to uppercase to match the mapping
+                            if target_zone:
+                                self.current_zone_target = target_zone
+                                self.state = State.SET_GOAL
+                                self.get_logger().info(f'Setting goal to {target_zone} for {item.colour} item')
+                                return  # Important: return here to prevent further movement
                             else:
-                                self.get_logger().info('Unable to pick up item: ' + response.message)
-                        except Exception as e:
-                            self.get_logger().info('Exception during pickup: ' + str(e))
-                    
-                    # Move towards item if not too close
-                    msg.linear.x = 0.15 * estimated_distance  # Reduced speed for better control
-                    msg.angular.z = item.x / 320.0  # Turn towards item
+                                self.get_logger().info(f'No zone mapping for item color: {item.colour}')
+                                self.state = State.FORWARD
+                            self.items.data = []  # Clear the items list after pickup
+                            return
+                        else:
+                            self.get_logger().info('Unable to pick up item: ' + response.message)
+                    except Exception as e:
+                        self.get_logger().info('Exception during pickup: ' + str(e))   
 
+                msg = Twist()
+                msg.linear.x = 0.25 * estimated_distance
+                msg.angular.z = item.x / 320.0
                 self.cmd_vel_publisher.publish(msg)
 
             case State.SET_GOAL:
