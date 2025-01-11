@@ -94,6 +94,10 @@ class RobotController(Node):
         self.zones = ZoneList()
         self.current_zone_target = None
 
+        # Get robot_id parameter first
+        self.declare_parameter('robot_id', 'robot1')
+        self.robot_id = self.get_parameter('robot_id').value
+
         # Initialize navigation
         self.navigator = BasicNavigator()
         
@@ -105,13 +109,13 @@ class RobotController(Node):
         # Spread robots around the starting area
         if self.robot_id == 'robot1':
             initial_pose.pose.position.x = -3.5
-            initial_pose.pose.position.y = 0.0
+            initial_pose.pose.position.y = 2.0
         elif self.robot_id == 'robot2':
             initial_pose.pose.position.x = -3.5
-            initial_pose.pose.position.y = 0.5
+            initial_pose.pose.position.y = 0.0
         else:  # robot3
             initial_pose.pose.position.x = -3.5
-            initial_pose.pose.position.y = -0.5
+            initial_pose.pose.position.y = -2.0
             
         initial_pose.pose.orientation.z = 0.0
         initial_pose.pose.orientation.w = 1.0
@@ -119,9 +123,6 @@ class RobotController(Node):
 
         # Wait for navigation to be ready
         self.navigator.waitUntilNav2Active()
-
-        self.declare_parameter('robot_id', 'robot1')
-        self.robot_id = self.get_parameter('robot_id').value
 
         # Here we use two callback groups, to ensure that those in 'client_callback_group' can be executed
         # independently from those in 'timer_callback_group'. This allos calling the services below within
