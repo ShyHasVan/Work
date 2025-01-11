@@ -65,7 +65,7 @@ ZONE_POSITIONS = {
     'ZONE_PINK': {'x': 2.5, 'y': 2.5},    # Pink zone in top left
     'ZONE_GREEN': {'x': 2.5, 'y': -2.5},   # Green zone in top right
     'ZONE_PURPLE': {'x': -2.5, 'y': -2.5}, # Purple zone in bottom right
-    'ZONE_CYAN': {'x': -2.5, 'y': 2.5}     # Cyan zone in bottom left
+    'ZONE_CYAN': {'x': -3.5, 'y': 2.5}     # Cyan zone in bottom left
 }
 
 # Map item colors to zones
