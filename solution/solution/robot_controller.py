@@ -20,14 +20,17 @@ from rclpy.signals import SignalHandlerOptions
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.qos import QoSPresetProfiles
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.duration import Duration
 
 from std_msgs.msg import Float32
-from geometry_msgs.msg import Twist, Pose
+from geometry_msgs.msg import Twist, Pose, PoseStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from assessment_interfaces.msg import Item, ItemList
+from assessment_interfaces.msg import Item, ItemList, Zone, ZoneList
 from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
+
+from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 
 from tf_transformations import euler_from_quaternion
 import angles
@@ -54,7 +57,15 @@ class State(Enum):
     FORWARD = 0
     TURNING = 1
     COLLECTING = 2
+    NAVIGATING_TO_ZONE = 3
 
+# Map item colors to zones
+ITEM_TO_ZONE = {
+    'red': 'ZONE_CYAN',
+    'green': 'ZONE_GREEN',
+    'blue': 'ZONE_PURPLE',
+    'yellow': 'ZONE_PINK'
+}
 
 class RobotController(Node):
 
@@ -72,6 +83,24 @@ class RobotController(Node):
         self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
         self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
         self.items = ItemList()
+        self.zones = ZoneList()
+        self.current_zone_target = None
+
+        # Initialize navigation
+        self.navigator = BasicNavigator()
+        
+        # Set initial pose for navigation
+        initial_pose = PoseStamped()
+        initial_pose.header.frame_id = 'map'
+        initial_pose.header.stamp = self.get_clock().now().to_msg()
+        initial_pose.pose.position.x = -2.0
+        initial_pose.pose.position.y = -0.5
+        initial_pose.pose.orientation.z = 0.0
+        initial_pose.pose.orientation.w = 1.0
+        self.navigator.setInitialPose(initial_pose)
+
+        # Wait for navigation to be ready
+        self.navigator.waitUntilNav2Active()
 
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
@@ -90,6 +119,13 @@ class RobotController(Node):
             ItemList,
             'items',
             self.item_callback,
+            10, callback_group=timer_callback_group
+        )
+
+        self.zone_subscriber = self.create_subscription(
+            ZoneList,
+            'zone',
+            self.zone_callback,
             10, callback_group=timer_callback_group
         )
 
@@ -199,6 +235,23 @@ class RobotController(Node):
         self.scan_triggered[SCAN_BACK]  = min(back_ranges)  < SCAN_THRESHOLD
         self.scan_triggered[SCAN_RIGHT] = min(right_ranges) < SCAN_THRESHOLD
 
+    def zone_callback(self, msg):
+        self.zones = msg
+
+    def get_zone_pose(self, zone_type):
+        for zone in self.zones.data:
+            if zone.zone == getattr(Zone, zone_type):
+                # Convert zone coordinates to a pose
+                goal_pose = PoseStamped()
+                goal_pose.header.frame_id = 'map'
+                goal_pose.header.stamp = self.get_clock().now().to_msg()
+                # Convert from camera coordinates to map coordinates
+                # Note: This is a simplified conversion, might need adjustment
+                goal_pose.pose.position.x = zone.x / 100.0  # Convert to meters
+                goal_pose.pose.position.y = zone.y / 100.0  # Convert to meters
+                goal_pose.pose.orientation.w = 1.0
+                return goal_pose
+        return None
 
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
@@ -291,7 +344,7 @@ class RobotController(Node):
                 item = self.items.data[0]
 
                 # Obtained by curve fitting from experimental runs.
-                estimated_distance = 32.4 * float(item.diameter) ** -0.75 #69.0 * float(item.diameter) ** -0.89
+                estimated_distance = 32.4 * float(item.diameter) ** -0.75
 
                 self.get_logger().info(f'Estimated distance {estimated_distance}')
 
@@ -304,7 +357,13 @@ class RobotController(Node):
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Item picked up.')
-                            self.state = State.FORWARD
+                            # After pickup, set target zone and switch to navigation
+                            target_zone = ITEM_TO_ZONE.get(item.colour)
+                            if target_zone:
+                                self.current_zone_target = target_zone
+                                self.state = State.NAVIGATING_TO_ZONE
+                            else:
+                                self.state = State.FORWARD
                             self.items.data = []
                         else:
                             self.get_logger().info('Unable to pick up item: ' + response.message)
@@ -315,6 +374,43 @@ class RobotController(Node):
                 msg.linear.x = 0.25 * estimated_distance
                 msg.angular.z = item.x / 320.0
                 self.cmd_vel_publisher.publish(msg)
+
+            case State.NAVIGATING_TO_ZONE:
+                if not self.current_zone_target:
+                    self.state = State.FORWARD
+                    return
+
+                zone_pose = self.get_zone_pose(self.current_zone_target)
+                if not zone_pose:
+                    self.get_logger().info(f'Cannot find target zone {self.current_zone_target}')
+                    self.state = State.FORWARD
+                    return
+
+                if not self.navigator.isTaskComplete():
+                    feedback = self.navigator.getFeedback()
+                    if feedback:
+                        self.get_logger().info('Estimated time to zone: ' + '{0:.0f}'.format(
+                            Duration.from_msg(feedback.estimated_time_remaining).nanoseconds / 1e9) + ' seconds.')
+                else:
+                    result = self.navigator.getResult()
+                    if result == TaskResult.SUCCEEDED:
+                        self.get_logger().info('Reached zone!')
+                        # Try to offload the item
+                        rqt = ItemRequest.Request()
+                        rqt.robot_id = self.robot_id
+                        try:
+                            future = self.offload_service.call_async(rqt)
+                            self.executor.spin_until_future_complete(future)
+                            response = future.result()
+                            if response.success:
+                                self.get_logger().info('Item offloaded successfully')
+                            else:
+                                self.get_logger().info('Failed to offload item: ' + response.message)
+                        except Exception as e:
+                            self.get_logger().info('Exception during offload: ' + str(e))
+                    self.current_zone_target = None
+                    self.state = State.FORWARD
+
             case _:
                 pass
         
