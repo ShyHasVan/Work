@@ -101,8 +101,8 @@ class RobotController(Node):
         initial_pose = PoseStamped()
         initial_pose.header.frame_id = 'map'
         initial_pose.header.stamp = self.get_clock().now().to_msg()
-        initial_pose.pose.position.x = -2.0
-        initial_pose.pose.position.y = -0.5
+        initial_pose.pose.position.x = -3.5
+        initial_pose.pose.position.y = 0.0
         initial_pose.pose.orientation.z = 0.0
         initial_pose.pose.orientation.w = 1.0
         self.navigator.setInitialPose(initial_pose)
@@ -392,7 +392,7 @@ class RobotController(Node):
                 goal_pose.pose.position.x = zone_pos['x']
                 goal_pose.pose.position.y = zone_pos['y']
                 
-                # Calculate orientation to face center
+                # Calculate orientation to face center of arena
                 dx = 0.0 - zone_pos['x']  # Vector to center x
                 dy = 0.0 - zone_pos['y']  # Vector to center y
                 angle = math.atan2(dy, dx)  # Calculate angle to face center
@@ -402,8 +402,8 @@ class RobotController(Node):
                 goal_pose.pose.orientation.w = math.cos(angle / 2.0)
 
                 # Send the goal to the navigator
-                self.navigator.goToPose(goal_pose)
-                self.get_logger().info(f'Goal set to zone at x:{zone_pos["x"]:.2f} y:{zone_pos["y"]:.2f}')
+                nav_path = self.navigator.goToPose(goal_pose)
+                self.get_logger().info(f'Goal set to zone at x:{zone_pos["x"]:.2f} y:{zone_pos["y"]:.2f} angle:{math.degrees(angle):.2f}°')
                 
                 # Move to navigation state
                 self.state = State.NAVIGATING_TO_ZONE
