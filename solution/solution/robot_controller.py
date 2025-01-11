@@ -45,7 +45,7 @@ ANGULAR_VELOCITY = 0.5 # Radians per second
 TURN_LEFT = 1 # Postive angular velocity turns left
 TURN_RIGHT = -1 # Negative angular velocity turns right
 
-SCAN_THRESHOLD = 0.5 # Metres per second
+SCAN_THRESHOLD = 0.2 # Metres - reduced from 0.5 to allow closer approach to obstacles
  # Array indexes for sensor sectors
 SCAN_FRONT = 0
 SCAN_LEFT = 1
