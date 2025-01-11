@@ -64,13 +64,13 @@ class State(Enum):
 ZONE_POSITIONS = {
     'ZONE_PINK': {'x': 2.5, 'y': 2.5},    # Pink zone in top left
     'ZONE_GREEN': {'x': 2.5, 'y': -2.5},   # Green zone in top right
-    'ZONE_PURPLE': {'x': -2.5, 'y': -2.5}, # Purple zone in bottom right
+    'ZONE_PURPLE': {'x': -3.5, 'y': -2.5}, # Purple zone in bottom right
     'ZONE_CYAN': {'x': -3.5, 'y': 2.5}     # Cyan zone in bottom left
 }
 
 # Map item colors to zones
 ITEM_TO_ZONE = {
-    'RED': 'ZONE_CYAN',     # Red items go to cyan zone
+    'RED': 'ZONE_PURPLE',     # Red items go to purple zone
     'GREEN': 'ZONE_GREEN',  # Green items go to green zone
     'BLUE': 'ZONE_PINK'     # Blue items go to pink zone
 }
@@ -361,9 +361,9 @@ class RobotController(Node):
                 if self.robot_id == 'robot1':
                     target_color = 'BLUE'
                 elif self.robot_id == 'robot2':
-                    target_color = 'RED'
-                elif self.robot_id == 'robot3':
                     target_color = 'GREEN'
+                elif self.robot_id == 'robot3':
+                    target_color = 'RED'
                 
                 available_items = [item for item in self.items.data 
                                  if id(item) not in self.blocked_items and 
