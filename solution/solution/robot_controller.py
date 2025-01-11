@@ -1,3 +1,4 @@
+
 #
 # Copyright (c) 2024 University of York and others
 #
@@ -25,7 +26,7 @@ from std_msgs.msg import Float32
 from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from assessment_interfaces.msg import Item, ItemList, Zone, ZoneList
+from assessment_interfaces.msg import Item, ItemList
 from auro_interfaces.msg import StringWithPose
 from auro_interfaces.srv import ItemRequest
 
@@ -55,13 +56,6 @@ class State(Enum):
     TURNING = 1
     COLLECTING = 2
 
-# Color to zone mapping
-ITEM_TO_ZONE = {
-    'red': Zone.ZONE_PINK,
-    'green': Zone.ZONE_GREEN,
-    'blue': Zone.ZONE_CYAN,
-    'purple': Zone.ZONE_PURPLE
-}
 
 class RobotController(Node):
 
@@ -69,29 +63,27 @@ class RobotController(Node):
         super().__init__('robot_controller')
         
         # Class variables used to store persistent values between executions of callbacks and control loop
-        self.state = State.FORWARD
-        self.pose = Pose()
-        self.previous_pose = Pose()
-        self.yaw = 0.0
-        self.previous_yaw = 0.0
-        self.turn_angle = 0.0
-        self.turn_direction = TURN_LEFT
-        self.goal_distance = random.uniform(1.0, 2.0)
-        self.scan_triggered = [False] * 4
+        self.state = State.FORWARD # Current FSM state
+        self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
+        self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
+        self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
+        self.previous_yaw = 0.0 # Snapshot of the angle for comparison against future angles
+        self.turn_angle = 0.0 # Relative angle to turn to in the TURNING state
+        self.turn_direction = TURN_LEFT # Direction to turn in the TURNING state
+        self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
+        self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
         self.items = ItemList()
-        self.zones = ZoneList()
-        self.current_item = None
-        self.searching_for_zone = False  # Flag to indicate if we're searching for a zone
-        self.search_start_time = None    # Time when zone search started
-        
+
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
 
-        # Create callback groups
+        # Here we use two callback groups, to ensure that those in 'client_callback_group' can be executed
+        # independently from those in 'timer_callback_group'. This allos calling the services below within
+        # a callback handled by the timer_callback_group. See https://docs.ros.org/en/humble/How-To-Guides/Using-callback-groups.html
+        # for a detailed discussion on the ROS executors and callback groups.
         client_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
 
-        # Services in client callback group
         self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
         self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
 
@@ -153,13 +145,6 @@ class RobotController(Node):
         self.timer_period = 0.1 # 100 milliseconds = 10 Hz
         self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
 
-        self.zone_subscriber = self.create_subscription(
-            ZoneList,
-            'zone',
-            self.zone_callback,
-            10, callback_group=timer_callback_group
-        )
-
     def item_callback(self, msg):
         if len(msg.data) > 0 and len(self.items.data) == 0:
             # Only log when we first see an item
@@ -215,57 +200,30 @@ class RobotController(Node):
         self.scan_triggered[SCAN_BACK]  = min(back_ranges)  < SCAN_THRESHOLD
         self.scan_triggered[SCAN_RIGHT] = min(right_ranges) < SCAN_THRESHOLD
 
-    def zone_callback(self, msg):
-        self.zones = msg
 
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
-        # Create a status message that combines state and sensor information
-        status_msg = f'State: {self.state}'
-        
-        # Add zone information
-        if len(self.zones.data) > 0:
-            zones_info = [f"Zone_{z.zone}({z.x}, {z.y}, size={z.size:.2f})" for z in self.zones.data]
-            status_msg += f', Zones in view: {", ".join(zones_info)}'
-        else:
-            status_msg += ', No zones in view'
-
-        # Add item information if relevant
-        if self.state == State.COLLECTING:
-            if len(self.items.data) > 0:
-                item = self.items.data[0]
-                status_msg += f', Nearest item at: ({item.x:.2f}, {item.y:.2f}), Color: {item.colour}'
-            else:
-                status_msg += ', No items visible'
-            if self.current_item:
-                status_msg += f', Holding: {self.current_item}'
-                target_zone = ITEM_TO_ZONE.get(self.current_item)
-                if target_zone:
-                    matching_zones = [z for z in self.zones.data if z.zone == target_zone]
-                    if matching_zones:
-                        zone = matching_zones[0]
-                        status_msg += f', Target zone at: ({zone.x}, {zone.y}), Size: {zone.size:.3f}'
-                    else:
-                        status_msg += f', Target zone ({target_zone}) not visible'
-
-        # Log the combined status message
-        self.get_logger().info(status_msg)
 
         # Send message to rviz_text_marker node
         marker_input = StringWithPose()
-        marker_input.text = str(self.state)
-        marker_input.pose = self.pose
+        marker_input.text = str(self.state) # Visualise robot state as an RViz marker
+        marker_input.pose = self.pose # Set the pose of the RViz marker to track the robot's pose
         self.marker_publisher.publish(marker_input)
+
+        #self.get_logger().info(f"{self.state}")
         
         match self.state:
+
             case State.FORWARD:
+
                 if self.scan_triggered[SCAN_FRONT]:
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
                     self.turn_angle = random.uniform(150, 170)
                     self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    self.get_logger().info("Detected obstacle in front, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
                     return
-
+                
                 if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
@@ -273,15 +231,17 @@ class RobotController(Node):
 
                     if self.scan_triggered[SCAN_LEFT] and self.scan_triggered[SCAN_RIGHT]:
                         self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                        self.get_logger().info("Detected obstacle to both the left and right, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
                     elif self.scan_triggered[SCAN_LEFT]:
                         self.turn_direction = TURN_RIGHT
-                    else:  # self.scan_triggered[SCAN_RIGHT]
+                        self.get_logger().info(f"Detected obstacle to the left, turning right by {self.turn_angle} degrees")
+                    else: # self.scan_triggered[SCAN_RIGHT]
                         self.turn_direction = TURN_LEFT
+                        self.get_logger().info(f"Detected obstacle to the right, turning left by {self.turn_angle} degrees")
                     return
                 
-                if len(self.items.data) > 0 and self.current_item is None:
+                if len(self.items.data) > 0:
                     self.state = State.COLLECTING
-                    self.searching_for_zone = False
                     return
 
                 msg = Twist()
@@ -292,21 +252,28 @@ class RobotController(Node):
                 difference_y = self.pose.position.y - self.previous_pose.position.y
                 distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
 
+                # self.get_logger().info(f"Driven {distance_travelled:.2f} out of {self.goal_distance:.2f} metres")
+
                 if distance_travelled >= self.goal_distance:
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
                     self.turn_angle = random.uniform(30, 150)
                     self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    self.get_logger().info("Goal reached, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
 
             case State.TURNING:
-                if len(self.items.data) > 0 and self.current_item is None:
+
+                self.get_logger().info("Turning state")
+
+                if len(self.items.data) > 0:
                     self.state = State.COLLECTING
-                    self.searching_for_zone = False
                     return
 
                 msg = Twist()
                 msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
+
+                # self.get_logger().info(f"Turned {math.degrees(math.fabs(yaw_difference)):.2f} out of {self.turn_angle:.2f} degrees")
 
                 yaw_difference = angles.normalize_angle(self.yaw - self.previous_yaw)                
 
@@ -314,110 +281,41 @@ class RobotController(Node):
                     self.previous_pose = self.pose
                     self.goal_distance = random.uniform(1.0, 2.0)
                     self.state = State.FORWARD
+                    self.get_logger().info(f"Finished turning, driving forward by {self.goal_distance:.2f} metres")
 
             case State.COLLECTING:
                 if len(self.items.data) == 0:
                     self.previous_pose = self.pose
-                    self.goal_distance = random.uniform(1.0, 2.0)
                     self.state = State.FORWARD
                     return
                 
-                closest_item = max(self.items.data, key=lambda x: x.diameter)
-                msg = Twist()
+                item = self.items.data[0]
 
-                angle_to_item = closest_item.x / 320.0
-                estimated_distance = 32.4 * float(closest_item.diameter) ** -0.75
+                # Obtained by curve fitting from experimental runs.
+                estimated_distance = 32.4 * float(item.diameter) ** -0.75 #69.0 * float(item.diameter) ** -0.89
 
-                if estimated_distance < 0.35:
-                    msg.linear.x = 0.0
-                    msg.angular.z = 0.0
-                    self.cmd_vel_publisher.publish(msg)
-                    
+                self.get_logger().info(f'Estimated distance {estimated_distance}')
+
+                if estimated_distance <= 0.35:
                     rqt = ItemRequest.Request()
                     rqt.robot_id = self.robot_id
                     try:
                         future = self.pick_up_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
+                        self.executor.spin_until_future_complete(future)
                         response = future.result()
                         if response.success:
-                            self.current_item = closest_item.colour
-                            self.get_logger().info(f'Successfully picked up {self.current_item} item')
-                            
-                            # After successful pickup, check for zones
-                            if len(self.zones.data) > 0:
-                                closest_zone = self.zones.data[0]
-                                self.get_logger().info(f'Found a zone, moving to it')
-                                
-                                # First stop any movement
-                                msg = Twist()
-                                msg.linear.x = 0.0
-                                msg.angular.z = 0.0
-                                self.cmd_vel_publisher.publish(msg)
-                                
-                                # Then start moving to zone
-                                msg = Twist()
-                                angle_to_zone = closest_zone.x / 320.0
-                                msg.linear.x = 0.2  # Fixed forward speed
-                                msg.angular.z = angle_to_zone
-                                self.cmd_vel_publisher.publish(msg)
-                                
-                                # If close enough, try to offload
-                                if closest_zone.size > 0.3:
-                                    rqt = ItemRequest.Request()
-                                    rqt.robot_id = self.robot_id
-                                    try:
-                                        future = self.offload_service.call_async(rqt)
-                                        rclpy.spin_until_future_complete(self, future)
-                                        response = future.result()
-                                        if response.success:
-                                            self.get_logger().info(f'Successfully offloaded {self.current_item} item')
-                                            self.current_item = None
-                                            self.state = State.FORWARD
-                                        else:
-                                            self.get_logger().info(f'Failed to offload item: {response.message}')
-                                    except Exception as e:
-                                        self.get_logger().info(f'Offload service call failed: {str(e)}')
-                            else:
-                                # No zones visible, start turning
-                                self.get_logger().info('No zones visible, turning to search')
-                                msg = Twist()
-                                msg.linear.x = 0.0
-                                msg.angular.z = ANGULAR_VELOCITY
-                                self.cmd_vel_publisher.publish(msg)
-                                
-                                # Wait a bit to let messages process
-                                rclpy.sleep(0.2)
-                                
-                                # Check if we see a zone
-                                if len(self.zones.data) > 0:
-                                    # First make sure we stop
-                                    msg = Twist()
-                                    msg.linear.x = 0.0
-                                    msg.angular.z = 0.0
-                                    self.cmd_vel_publisher.publish(msg)
-                                    
-                                    # Wait a bit to ensure stop message is processed
-                                    rclpy.sleep(0.2)
-                                    
-                                    # Then move to the zone
-                                    closest_zone = self.zones.data[0]
-                                    self.get_logger().info(f'Found a zone after turning, moving to it')
-                                    msg = Twist()
-                                    angle_to_zone = closest_zone.x / 320.0
-                                    msg.linear.x = 0.2  # Fixed forward speed
-                                    msg.angular.z = angle_to_zone
-                                    self.cmd_vel_publisher.publish(msg)
+                            self.get_logger().info('Item picked up.')
+                            self.state = State.FORWARD
+                            self.items.data = []
                         else:
-                            self.get_logger().info(f'Failed to pick up item: {response.message}')
-                            msg.linear.x = 0.05
-                            self.cmd_vel_publisher.publish(msg)
+                            self.get_logger().info('Unable to pick up item: ' + response.message)
                     except Exception as e:
-                        self.get_logger().info(f'Service call failed: {str(e)}')
-                else:
-                    msg.linear.x = 0.25 * estimated_distance
-                    msg.angular.z = angle_to_item
-                    self.cmd_vel_publisher.publish(msg)
+                        self.get_logger().info('Exception ' + e)   
 
+                msg = Twist()
+                msg.linear.x = 0.25 * estimated_distance
+                msg.angular.z = item.x / 320.0
+                self.cmd_vel_publisher.publish(msg)
             case _:
                 pass
         
