@@ -107,7 +107,7 @@ class RobotController(Node):
         initial_pose.header.frame_id = 'map'
         initial_pose.header.stamp = self.get_clock().now().to_msg()
         
-        # Hardcode different initial poses for each robot - matching assessment/config/initial_poses.yaml
+        # initial poses for each robot
         if self.robot_id == 'robot1':
             initial_pose.pose.position.x = -3.5  # Left side
             initial_pose.pose.position.y = 2.0   # Top position
